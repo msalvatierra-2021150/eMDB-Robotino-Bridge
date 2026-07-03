@@ -1,0 +1,42 @@
+# ROS2 / Colcon
+build/
+install/
+log/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# VS Code
+.vscode/
+
+# CLion
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Linux
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ROS generated files
+compile_commands.json
+
+# Robotino SDK (if installed locally)
+usr/local/robotino/
+opt/robotino/
+
+# Environment files
+.env
+.env.*
+
+# Temporary files
+tmp/
+temp/

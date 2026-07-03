@@ -1,0 +1,39 @@
+Experiment:
+  name: main_loop
+  class_name: cognitive_processes.main_loop.MainLoop
+  new_executor: True
+  threads: 2
+  parameters:
+    iterations: 10000
+    trials: 20
+    subgoals: False
+    softmax_selection: True
+    softmax_temperature: 0.3
+    kill_on_finish: False
+
+LTM:
+  Nodes:
+    Perception:
+      -
+        name: tag_detection
+        class_name: robotino_emdb_perception.robotino_tag_perception.RobotinoTagPerception
+        parameters:
+          default_msg: robotino_emdb_interfaces.msg.RobotinoTag
+          default_topic: /robotino/emdb/tag_detection
+          normalize_data:
+            target_tag_id: 3
+
+            distance_min: 0.2
+            distance_max: 3.0
+
+            angle_min: -1.57
+            angle_max: 1.57
+
+            center_x_min: 0.0
+            center_x_max: 1.0
+
+            center_y_min: 0.0
+            center_y_max: 1.0
+
+            confidence_min: 0.0
+            confidence_max: 100.0
