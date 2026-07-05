@@ -1,3 +1,5 @@
+std_msgs/Header header
+
 bool visible
 int32 tag_id
 string family

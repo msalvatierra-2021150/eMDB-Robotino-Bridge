@@ -86,7 +86,7 @@ class AprilTagTFToEMDBBridge(Node):
         tag_frame = f"tag_{tag_id}"
 
         output = RobotinoTag()
-
+        output.header = msg.header
         output.visible = True
         output.tag_id = tag_id
         output.family = str(detection.family)
@@ -226,6 +226,9 @@ class AprilTagTFToEMDBBridge(Node):
         output.robot_x_map = 0.0
         output.robot_y_map = 0.0
         output.robot_yaw_map = 0.0
+
+        output.header.stamp = self.get_clock().now().to_msg()
+        output.header.frame_id = self.camera_frame
 
         self.publisher.publish(output)
 

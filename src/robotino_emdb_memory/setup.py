@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'robotino_emdb_perception'
+package_name = 'robotino_emdb_memory'
 
 setup(
     name=package_name,
@@ -24,8 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'tag_perception = robotino_emdb_perception.robotino_tag_perception:main',
-            'foraging_perception = robotino_emdb_perception.robotino_foraging_perception:main',
+            'foraging_memory = robotino_emdb_memory.robotino_foraging_memory:main',
         ],
     },
 )

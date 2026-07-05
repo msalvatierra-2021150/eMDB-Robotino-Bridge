@@ -51,6 +51,27 @@ LTM:
             map_x_max: 3.0
             map_y_min: -3.0
             map_y_max: 3.0
+      -
+        name: foraging_state
+        class_name: robotino_emdb_perception.robotino_foraging_perception.RobotinoForagingPerception
+        parameters:
+          default_msg: robotino_emdb_interfaces.msg.RobotinoForagingState
+          default_topic: /robotino/emdb/foraging_state
+          normalize_data:
+            distance_min: 0.0
+            distance_max: 3.0
+
+            bearing_min: -1.57
+            bearing_max: 1.57
+
+            map_x_min: -3.0
+            map_x_max: 3.0
+
+            map_y_min: -3.0
+            map_y_max: 3.0
+
+            times_seen_max: 10.0
+            total_reward_max: 3.0
 
     RobotPurpose:
       -
