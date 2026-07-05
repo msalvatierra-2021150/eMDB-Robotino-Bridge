@@ -6,7 +6,7 @@ class RobotinoTagPerception(Perception):
     def __init__(
         self,
         name="tag_detection",
-        class_name="robotino_emdb_perception.robotino_tag_perception.RobotinoTagPerception",
+        class_name="cognitive_nodes.perception.Perception",
         default_msg=None,
         default_topic=None,
         normalize_data=None,

@@ -11,7 +11,29 @@ Experiment:
     softmax_temperature: 0.3
     kill_on_finish: False
 
+Control:
+  id: robotino_control
+
+  control_topic: /main_loop/control
+  control_msg: cognitive_processes_interfaces.msg.ControlMsg
+
+  episodes_topic: /main_loop/episodes
+  episodes_msg: cognitive_node_interfaces.msg.Episode
+
+  world_reset_service: /emdb/robotino/world_reset
+  world_reset_msg: cognitive_processes_interfaces.srv.WorldReset
+  
 LTM:
+  Files:
+    -
+      id: goodness
+      class: core.file.FileGoodness
+      file: robotino_goodness.txt
+    -
+      id: pnodes_success
+      class: core.file.FilePNodesSuccess
+      file: robotino_pnodes_success.txt
+
   Nodes:
     Perception:
       -
@@ -21,19 +43,51 @@ LTM:
           default_msg: robotino_emdb_interfaces.msg.RobotinoTag
           default_topic: /robotino/emdb/tag_detection
           normalize_data:
-            target_tag_id: 3
-
-            distance_min: 0.2
+            distance_min: 0.0
             distance_max: 3.0
+            bearing_min: -1.57
+            bearing_max: 1.57
+            map_x_min: -3.0
+            map_x_max: 3.0
+            map_y_min: -3.0
+            map_y_max: 3.0
 
-            angle_min: -1.57
-            angle_max: 1.57
+    RobotPurpose:
+      -
+        name: novelty_need
+        class_name: cognitive_nodes.robot_purpose.RobotPurpose
+        parameters:
+          weight: 1.0
+          drive_id: novelty_drive
+          purpose_type: Need
+          terminal: False
 
-            center_x_min: 0.0
-            center_x_max: 1.0
+    Drive:
+      -
+        name: novelty_drive
+        class_name: cognitive_nodes.novelty.DriveNovelty
+        parameters:
+          neighbors: [{"name": "novelty_need", "node_type": "RobotPurpose"}]
 
-            center_y_min: 0.0
-            center_y_max: 1.0
-
-            confidence_min: 0.0
-            confidence_max: 100.0
+  Connectors:
+    -
+      data: Space
+      default_class: cognitive_nodes.space.SVMSpace
+    -
+      data: Perception
+      default_class: cognitive_nodes.perception.Perception
+    -
+      data: PNode
+      default_class: cognitive_nodes.pnode.PNode
+    -
+      data: CNode
+      default_class: cognitive_nodes.cnode.CNode
+    -
+      data: Goal
+      default_class: cognitive_nodes.goal.Goal
+    -
+      data: WorldModel
+      default_class: cognitive_nodes.world_model.WorldModel
+    -
+      data: Policy
+      default_class: cognitive_nodes.policy.Policy
