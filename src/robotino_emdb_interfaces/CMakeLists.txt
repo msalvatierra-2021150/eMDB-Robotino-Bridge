@@ -12,6 +12,9 @@ find_package(std_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/RobotinoTag.msg"
   "msg/RobotinoForagingState.msg"
+  "msg/RobotinoMotivationState.msg"
+  "msg/RobotinoSelectedPolicy.msg"
+  "msg/RobotinoPolicyOutcome.msg"
   DEPENDENCIES std_msgs
 )
 

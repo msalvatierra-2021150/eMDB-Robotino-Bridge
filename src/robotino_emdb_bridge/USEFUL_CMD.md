@@ -18,3 +18,6 @@ ros2 launch robotino_emdb_experiments robotino_semantic_experiment_launch.py
 
 See Foraging State Values
 ros2 topic echo /perception/foraging_state/value
+
+
+ros2 launch robotino_emdb_experiments robotino_full_emdb_launch.py
