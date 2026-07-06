@@ -1,14 +1,20 @@
 import math
+import yaml
+from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
 
 from robotino_emdb_interfaces.msg import RobotinoTag, RobotinoForagingState
 
-
 class RobotinoForagingMemory(Node):
     def __init__(self):
         super().__init__("robotino_foraging_memory")
+
+        self.declare_parameter(
+            "semantics_file",
+            "/home/mike/eMDB_ws/src/robotino_emdb_memory/config/foraging_semantics.yaml"
+        )        
 
         self.declare_parameter("input_topic", "/robotino/emdb/tag_observation")
         self.declare_parameter("output_topic", "/robotino/emdb/foraging_state")
@@ -35,22 +41,15 @@ class RobotinoForagingMemory(Node):
         self.same_tag_event_gap = float(self.get_parameter("same_tag_event_gap").value)
 
         # Semantic meaning of each tag.
-        # Later we can move this to a YAML file.
-        self.tag_semantics = {
-            0: {"type": "landmark", "energy": 0.0},
-            1: {"type": "energy_bank", "energy": 0.30},
-            2: {"type": "energy_bank", "energy": 0.50},
-            3: {"type": "landmark", "energy": 0.0},
-            4: {"type": "high_energy_bank", "energy": 0.80},
-            5: {"type": "goal_marker", "energy": 0.0},
-        }
-
+        self.semantics_file = self.get_parameter("semantics_file").value
+        self.tag_semantics = self.load_tag_semantics(self.semantics_file)
+        
         # Episodic/resource memory.
         # Key: tag_id
         # Value: remembered information about that tag.
         self.memory = {}
-
-        self.last_update_time = self.get_clock().now()
+        self.episodes = []
+        self.episode_count = 0
 
         self.subscriber = self.create_subscription(
             RobotinoTag,
@@ -71,10 +70,46 @@ class RobotinoForagingMemory(Node):
         self.get_logger().info(f"Subscribing to: {self.input_topic}")
         self.get_logger().info(f"Publishing to: {self.output_topic}")
 
+    def load_tag_semantics(self, semantics_file):
+        path = Path(semantics_file)
+
+        if not path.exists():
+            self.get_logger().warn(
+                f"Semantics file not found: {semantics_file}. Using defaults."
+            )
+            return {
+                0: {"type": "landmark", "is_energy_bank": False, "capacity": 0.0, "collection_rate": 0.0, "regen_rate": 0.0},
+                1: {"type": "low_energy_bank", "is_energy_bank": True, "capacity": 0.30, "collection_rate": 0.08, "regen_rate": 0.0},
+                2: {"type": "medium_energy_bank", "is_energy_bank": True, "capacity": 0.50, "collection_rate": 0.12, "regen_rate": 0.0},
+                3: {"type": "checkpoint", "is_energy_bank": False, "capacity": 0.0, "collection_rate": 0.0, "regen_rate": 0.0},
+                4: {"type": "high_energy_bank", "is_energy_bank": True, "capacity": 0.80, "collection_rate": 0.18, "regen_rate": 0.0},
+                5: {"type": "goal_marker", "is_energy_bank": False, "capacity": 0.0, "collection_rate": 0.0, "regen_rate": 0.0},
+            }
+
+        with open(path, "r") as file:
+            data = yaml.safe_load(file) or {}
+
+        semantics = {}
+
+        for raw_id, tag_data in data.get("tags", {}).items():
+            tag_id = int(raw_id)
+
+            semantics[tag_id] = {
+                "type": str(tag_data.get("type", "unknown")),
+                "is_energy_bank": bool(tag_data.get("is_energy_bank", False)),
+                "capacity": float(tag_data.get("capacity", 0.0)),
+                "collection_rate": float(tag_data.get("collection_rate", 0.0)),
+                "regen_rate": float(tag_data.get("regen_rate", 0.0)),
+            }
+
+        self.get_logger().info(f"Loaded tag semantics from: {semantics_file}")
+        return semantics
+
     def energy_decay_step(self):
         self.robot_energy -= self.energy_decay_per_second
         self.robot_energy = self.clamp(self.robot_energy, 0.0, 1.0)
-
+    
+    #Observations
     def observation_callback(self, msg: RobotinoTag):
         now = self.get_clock().now()
         now_sec = now.nanoseconds / 1e9
@@ -95,42 +130,63 @@ class RobotinoForagingMemory(Node):
         if not msg.visible or msg.tag_id < 0:
             state.tag_id = -1
             state.tag_type = "none"
+
+            state.robot_x_map = float(msg.robot_x_map)
+            state.robot_y_map = float(msg.robot_y_map)
+            state.robot_yaw_map = float(msg.robot_yaw_map)
+
             state.first_time_seen = False
             state.known_tag = False
             state.resource_available = False
-            state.best_energy_tag_id = self.get_best_energy_bank_id()
+
             self.fill_best_energy_bank(state)
+
             self.publisher.publish(state)
             return
 
         tag_id = int(msg.tag_id)
         semantics = self.tag_semantics.get(
             tag_id,
-            {"type": "unknown", "energy": 0.0}
+            {
+                "type": "unknown",
+                "is_energy_bank": False,
+                "capacity": 0.0,
+                "collection_rate": 0.0,
+                "regen_rate": 0.0,
+            }
         )
 
         tag_type = semantics["type"]
-        resource_capacity = float(semantics["energy"])
-        is_energy_bank = resource_capacity > 0.0
+        is_energy_bank = bool(semantics["is_energy_bank"])
+        resource_capacity = float(semantics["capacity"])
+        collection_rate = float(semantics["collection_rate"])
+        regen_rate = float(semantics["regen_rate"])
 
         first_time_seen = tag_id not in self.memory
-
+        
+        #First Time Seen?
         if first_time_seen:
             self.memory[tag_id] = {
                 "tag_type": tag_type,
                 "first_seen_time": now_sec,
                 "last_seen_time": now_sec,
+                "last_resource_update_time": now_sec,
                 "times_seen": 1,
 
                 "tag_x_map": float(msg.tag_x_map),
                 "tag_y_map": float(msg.tag_y_map),
                 "tag_yaw_map": float(msg.tag_yaw_map),
 
+                "last_seen_robot_x_map": float(msg.robot_x_map),
+                "last_seen_robot_y_map": float(msg.robot_y_map),
+                "last_seen_robot_yaw_map": float(msg.robot_yaw_map),
+
+                "is_energy_bank": is_energy_bank,
                 "resource_capacity": resource_capacity,
                 "resource_remaining": resource_capacity,
-                "is_energy_bank": is_energy_bank,
+                "collection_rate": collection_rate,
+                "regen_rate": regen_rate,
             }
-
             novelty_reward = 1.0
 
         else:
@@ -152,32 +208,30 @@ class RobotinoForagingMemory(Node):
             )
             remembered["tag_yaw_map"] = float(msg.tag_yaw_map)
 
-            novelty_reward = 0.05 if time_since_last_seen >= self.same_tag_event_gap else 0.0
-
+            novelty_reward = 0.05 if time_since_last_seen >= self.same_tag_event_gap else 0.0      
+        
         remembered = self.memory[tag_id]
+        self.update_resource_bank(tag_id, now_sec)
 
-        energy_reward = 0.0
+        energy_reward = self.collect_energy_from_bank(tag_id, msg, now_sec)
+
+        if first_time_seen:
+            self.add_episode("NEW_TAG_DISCOVERED", tag_id, msg, novelty_reward)
+
+        if first_time_seen and is_energy_bank:
+            self.add_episode("ENERGY_BANK_DISCOVERED", tag_id, msg, novelty_reward)
+
+        if energy_reward > 0.0:
+            self.add_episode("ENERGY_COLLECTED", tag_id, msg, energy_reward)
 
         resource_remaining = float(remembered["resource_remaining"])
-        resource_available = is_energy_bank and resource_remaining > 0.0
-
-        # Recharge if the robot is close enough to the energy bank.
-        if (
-            is_energy_bank
-            and resource_available
-            and msg.distance <= self.arrival_distance
-        ):
-            recharge = min(resource_remaining, 1.0 - self.robot_energy)
-
-            if recharge > 0.0:
-                self.robot_energy += recharge
-                remembered["resource_remaining"] -= recharge
-                energy_reward = recharge
+        resource_available = bool(
+            remembered["is_energy_bank"] and resource_remaining > 0.0
+        )
 
         goal_reward = 1.0 if tag_type == "goal_marker" else 0.0
         goal_satisfied = tag_type == "goal_marker"
 
-        # Simple reward model.
         total_reward = novelty_reward + energy_reward + goal_reward
 
         state.visible = True
@@ -188,9 +242,9 @@ class RobotinoForagingMemory(Node):
         state.distance = float(msg.distance)
         state.bearing = float(msg.bearing)
 
-        state.tag_x_map = float(msg.tag_x_map)
-        state.tag_y_map = float(msg.tag_y_map)
-        state.tag_yaw_map = float(msg.tag_yaw_map)
+        state.tag_x_map = float(remembered["tag_x_map"])
+        state.tag_y_map = float(remembered["tag_y_map"])
+        state.tag_yaw_map = float(remembered["tag_yaw_map"])
 
         state.robot_x_map = float(msg.robot_x_map)
         state.robot_y_map = float(msg.robot_y_map)
@@ -201,13 +255,11 @@ class RobotinoForagingMemory(Node):
         state.times_seen = int(remembered["times_seen"])
         state.time_since_last_seen = float(now_sec - remembered["last_seen_time"])
 
-        state.is_energy_bank = bool(is_energy_bank)
-        state.resource_capacity = float(resource_capacity)
+        state.is_energy_bank = bool(remembered["is_energy_bank"])
+        state.resource_capacity = float(remembered["resource_capacity"])
         state.resource_remaining = float(remembered["resource_remaining"])
-        state.resource_value = float(resource_capacity)
-        state.resource_available = bool(
-            is_energy_bank and remembered["resource_remaining"] > 0.0
-        )
+        state.resource_value = float(remembered["resource_capacity"])
+        state.resource_available = bool(resource_available)
 
         state.robot_energy = float(self.robot_energy)
         state.energy_need = self.clamp(
@@ -226,27 +278,6 @@ class RobotinoForagingMemory(Node):
         state.goal_satisfied = bool(goal_satisfied)
 
         self.publisher.publish(state)
-
-    def get_best_energy_bank_id(self):
-        best_id = -1
-        best_score = 0.0
-
-        for tag_id, data in self.memory.items():
-            if not data["is_energy_bank"]:
-                continue
-
-            remaining = float(data["resource_remaining"])
-
-            if remaining <= 0.0:
-                continue
-
-            score = remaining
-
-            if score > best_score:
-                best_score = score
-                best_id = tag_id
-
-        return best_id
 
     def fill_best_energy_bank(self, state: RobotinoForagingState):
         best_id = -1
@@ -283,6 +314,113 @@ class RobotinoForagingMemory(Node):
 
     def clamp(self, value, min_value, max_value):
         return float(max(min_value, min(max_value, value)))
+
+    # Resource Bank logic
+    def update_resource_bank(self, tag_id, now_sec):
+        if tag_id not in self.memory:
+            return
+
+        data = self.memory[tag_id]
+
+        if not data["is_energy_bank"]:
+            return
+
+        last_time = float(data.get("last_resource_update_time", now_sec))
+        dt = max(0.0, now_sec - last_time)
+
+        capacity = float(data["resource_capacity"])
+        remaining = float(data["resource_remaining"])
+        regen_rate = float(data["regen_rate"])
+
+        if regen_rate > 0.0:
+            remaining = min(capacity, remaining + regen_rate * dt)
+
+        data["resource_remaining"] = remaining
+        data["last_resource_update_time"] = now_sec
+
+    # Energy from bank
+    def collect_energy_from_bank(self, tag_id, msg, now_sec):
+        if tag_id not in self.memory:
+            return 0.0
+
+        data = self.memory[tag_id]
+
+        if not data["is_energy_bank"]:
+            return 0.0
+
+        if msg.distance <= 0.05:
+            return 0.0
+
+        if msg.distance > self.arrival_distance:
+            return 0.0
+
+        remaining = float(data["resource_remaining"])
+
+        if remaining <= 0.0:
+            return 0.0
+
+        if self.robot_energy >= 1.0:
+            return 0.0
+
+        last_time = float(data.get("last_collection_time", now_sec))
+        dt = max(0.0, now_sec - last_time)
+
+        # Avoid huge energy jumps if the node was paused or started late.
+        dt = min(dt, 1.0)
+
+        collection_rate = float(data["collection_rate"])
+
+        amount_to_take = collection_rate * dt
+
+        amount_taken = min(
+            amount_to_take,
+            remaining,
+            1.0 - self.robot_energy
+        )
+
+        if amount_taken <= 0.0:
+            data["last_collection_time"] = now_sec
+            return 0.0
+
+        self.robot_energy = self.clamp(
+            self.robot_energy + amount_taken,
+            0.0,
+            1.0
+        )
+
+        data["resource_remaining"] = remaining - amount_taken
+        data["last_collection_time"] = now_sec
+
+        return float(amount_taken)
+    
+    #Episodes
+    def add_episode(self, event_type, tag_id, msg, reward):
+        self.episode_count += 1
+
+        episode = {
+            "episode_id": self.episode_count,
+            "time": self.get_clock().now().nanoseconds / 1e9,
+            "event_type": event_type,
+            "tag_id": int(tag_id),
+            "robot_x_map": float(msg.robot_x_map),
+            "robot_y_map": float(msg.robot_y_map),
+            "robot_yaw_map": float(msg.robot_yaw_map),
+            "tag_x_map": float(msg.tag_x_map),
+            "tag_y_map": float(msg.tag_y_map),
+            "distance": float(msg.distance),
+            "bearing": float(msg.bearing),
+            "confidence": float(msg.confidence),
+            "robot_energy": float(self.robot_energy),
+            "reward": float(reward),
+        }
+
+        self.episodes.append(episode)
+
+        self.get_logger().info(
+            f"Episode {self.episode_count}: {event_type}, "
+            f"tag={tag_id}, reward={reward:.3f}, "
+            f"energy={self.robot_energy:.3f}"
+        )
 
 
 def main(args=None):

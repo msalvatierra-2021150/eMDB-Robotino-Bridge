@@ -8,7 +8,7 @@ ros2 run robotino_emdb_bridge apriltag_tf_to_emdb_bridge --ros-args \
   -p camera_frame:=camera_optical_frame
 
 To see the topic
-ros2 topic echo /robotino/emdb/tag_detection
+ros2 topic echo /robotino/emdb/tag_observation
 
 Run Foragin Memory
 ros2 run robotino_emdb_memory foraging_memory
