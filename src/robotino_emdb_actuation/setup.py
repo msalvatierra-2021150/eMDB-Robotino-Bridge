@@ -1,4 +1,6 @@
 from setuptools import find_packages, setup
+from glob import glob
+import os
 
 package_name = 'robotino_emdb_actuation'
 
@@ -10,6 +12,13 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'config'),
+            glob(os.path.join('config', '*.yaml'))),
+
+        (os.path.join('share', package_name, 'maps'),
+            glob(os.path.join('maps', '*.yaml')) +
+            glob(os.path.join('maps', '*.pgm')) +
+            glob(os.path.join('maps', '*.png'))),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

@@ -2,6 +2,7 @@
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
@@ -21,6 +22,13 @@ def generate_launch_description():
     nav2_action_name = LaunchConfiguration('nav2_action_name')
     publish_exploration_control = LaunchConfiguration('publish_exploration_control')
 
+    # Nav2 launch arguments
+    start_nav2 = LaunchConfiguration('start_nav2')
+    use_sim_time = LaunchConfiguration('use_sim_time')
+    autostart = LaunchConfiguration('autostart')
+    map_file = LaunchConfiguration('map')
+    nav2_params_file = LaunchConfiguration('nav2_params_file')
+
     semantic_experiment_launch = PathJoinSubstitution([
         FindPackageShare('robotino_emdb_experiments'),
         'launch',
@@ -32,6 +40,47 @@ def generate_launch_description():
         'config',
         'foraging_semantics.yaml'
     ])
+
+    # Your tuned Nav2 YAML should be here:
+    # robotino_emdb_actuation/config/nav2_params.yaml
+    default_nav2_params_file = PathJoinSubstitution([
+        FindPackageShare('robotino_emdb_actuation'),
+        'config',
+        'nav2_params.yaml'
+    ])
+
+    # Change this path to your real saved map file.
+    # Example package structure:
+    # robotino_emdb_actuation/maps/robotino_map.yaml
+    default_map_file = PathJoinSubstitution([
+        FindPackageShare('robotino_emdb_actuation'),
+        'maps',
+        'robotino_map.yaml'
+    ])
+
+    # Nav2 bringup launch
+    nav2_bringup_launch = PathJoinSubstitution([
+        FindPackageShare('nav2_bringup'),
+        'launch',
+        'bringup_launch.py'
+    ])
+
+    nav2_bringup = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(nav2_bringup_launch),
+        condition=IfCondition(start_nav2),
+        launch_arguments={
+            'use_sim_time': use_sim_time,
+            'autostart': autostart,
+            'map': map_file,
+            'params_file': nav2_params_file,
+
+            # Important: capitalized for Nav2 PythonExpression conditions
+            'slam': 'False',
+            'use_namespace': 'False',
+            'namespace': '',
+            'use_composition': 'False',
+        }.items()
+    )
 
     # 1. Bridge: /detections + /tf -> /robotino/emdb/tag_observation
     apriltag_tf_bridge_node = Node(
@@ -113,8 +162,6 @@ def generate_launch_description():
             'nav2_action_name': nav2_action_name,
             'map_frame': map_frame,
 
-            # IMPORTANT:
-            # Use ParameterValue so launch converts "true"/"false" into real booleans.
             'enable_nav2_execution': ParameterValue(
                 enable_nav2_execution,
                 value_type=bool
@@ -181,12 +228,51 @@ def generate_launch_description():
             description='If true, publishes exploration enable/disable commands.'
         ),
 
+        # Nav2 arguments
+        DeclareLaunchArgument(
+            'start_nav2',
+            default_value='true',
+            description='If true, starts Nav2 bringup from this launch file.'
+        ),
+
+        DeclareLaunchArgument(
+            'use_sim_time',
+            default_value='true',
+            description='Use simulation clock.'
+        ),
+
+        DeclareLaunchArgument(
+            'autostart',
+            default_value='true',
+            description='Automatically start Nav2 lifecycle nodes.'
+        ),
+
+        DeclareLaunchArgument(
+            'map',
+            default_value=default_map_file,
+            description='Full path to map YAML file for Nav2 localization.'
+        ),
+
+        DeclareLaunchArgument(
+            'nav2_params_file',
+            default_value=default_nav2_params_file,
+            description='Full path to Nav2 parameters YAML file.'
+        ),
+
+        # 0. Start Nav2 first
+        nav2_bringup,
+
         # 1. Start AprilTag TF to e-MDB bridge
-        apriltag_tf_bridge_node,
+        TimerAction(
+            period=1.0,
+            actions=[
+                apriltag_tf_bridge_node
+            ]
+        ),
 
         # 2. Start foraging semantic memory
         TimerAction(
-            period=1.0,
+            period=2.0,
             actions=[
                 foraging_memory_node
             ]
@@ -194,7 +280,7 @@ def generate_launch_description():
 
         # 3. Start motivational system
         TimerAction(
-            period=2.0,
+            period=3.0,
             actions=[
                 motivational_system_node
             ]
@@ -202,15 +288,15 @@ def generate_launch_description():
 
         # 4. Start policy selector
         TimerAction(
-            period=3.0,
+            period=4.0,
             actions=[
                 policy_selector_node
             ]
         ),
 
-        # 5. Start policy executor / actuation
+        # 5. Start policy executor / actuation after Nav2 has time to come up
         TimerAction(
-            period=4.0,
+            period=6.0,
             actions=[
                 policy_executor_node
             ]
@@ -218,7 +304,7 @@ def generate_launch_description():
 
         # 6. Start the semantic/e-MDB experiment
         TimerAction(
-            period=5.0,
+            period=7.0,
             actions=[
                 semantic_experiment
             ]

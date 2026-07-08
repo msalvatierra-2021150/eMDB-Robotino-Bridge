@@ -6,7 +6,6 @@ from robotino_emdb_interfaces.msg import (
     RobotinoSelectedPolicy,
 )
 
-
 class RobotinoPolicySelector(Node):
     """
     Decision layer.
