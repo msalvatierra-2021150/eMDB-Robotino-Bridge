@@ -14,6 +14,18 @@ from robotino_emdb_interfaces.msg import (
     RobotinoForagingState,
 )
 
+from robotino_emdb_actuation.navigation_geometry import (
+    euclidean_distance,
+    compute_approach_pose,
+    yaw_to_quaternion_z_w,
+)
+ENERGY_APPROACH_STANDOFF_M = 0.25
+GOAL_APPROACH_STANDOFF_M = 0.30
+
+ENERGY_INTERACTION_DISTANCE_M = 0.30
+GOAL_INTERACTION_DISTANCE_M = 0.35
+
+MIN_DISTANCE_EPSILON_M = 0.001
 
 class RobotinoPolicyExecutor(Node):
     """
@@ -39,18 +51,20 @@ class RobotinoPolicyExecutor(Node):
     POLICY_SEARCH_FOR_ENERGY = 3
     POLICY_GOAL_REACHED = 4
 
+    POLICY_TOPIC = "/robotino/emdb/selected_policy"
+    FORAGING_TOPIC = "/robotino/emdb/foraging_state"
+    OUTCOME_TOPIC = "/robotino/emdb/policy_outcome"
+
+    CMD_VEL_TOPIC = "/cmd_vel"
+    EXPLORATION_ENABLE_TOPIC = "/robotino/emdb/exploration_enable"
+
+    NAV2_ACTION_NAME = "navigate_to_pose"
+    MAP_FRAME = "map"
+
+    MINIMUM_GOAL_INTERVAL_S = 5.0
+
     def __init__(self):
         super().__init__("robotino_policy_executor")
-
-        self.declare_parameter("policy_topic", "/robotino/emdb/selected_policy")
-        self.declare_parameter("foraging_topic", "/robotino/emdb/foraging_state")
-        self.declare_parameter("outcome_topic", "/robotino/emdb/policy_outcome")
-
-        self.declare_parameter("cmd_vel_topic", "/cmd_vel")
-        self.declare_parameter("exploration_enable_topic", "/robotino/emdb/exploration_enable")
-
-        self.declare_parameter("nav2_action_name", "navigate_to_pose")
-        self.declare_parameter("map_frame", "map")
 
         # Safety switch. Keep false until selected_policy looks correct.
         self.declare_parameter("enable_nav2_execution", False)
@@ -59,18 +73,6 @@ class RobotinoPolicyExecutor(Node):
         # You can later connect this to your frontier exploration manager.
         self.declare_parameter("publish_exploration_control", False)
 
-        self.declare_parameter("minimum_goal_interval", 5.0)
-
-        self.policy_topic = self.get_parameter("policy_topic").value
-        self.foraging_topic = self.get_parameter("foraging_topic").value
-        self.outcome_topic = self.get_parameter("outcome_topic").value
-
-        self.cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
-        self.exploration_enable_topic = self.get_parameter("exploration_enable_topic").value
-
-        self.nav2_action_name = self.get_parameter("nav2_action_name").value
-        self.map_frame = self.get_parameter("map_frame").value
-
         self.enable_nav2_execution = bool(
             self.get_parameter("enable_nav2_execution").value
         )
@@ -78,9 +80,17 @@ class RobotinoPolicyExecutor(Node):
             self.get_parameter("publish_exploration_control").value
         )
 
-        self.minimum_goal_interval = float(
-            self.get_parameter("minimum_goal_interval").value
-        )
+        self.policy_topic = self.POLICY_TOPIC
+        self.foraging_topic = self.FORAGING_TOPIC
+        self.outcome_topic = self.OUTCOME_TOPIC
+
+        self.cmd_vel_topic = self.CMD_VEL_TOPIC
+        self.exploration_enable_topic = self.EXPLORATION_ENABLE_TOPIC
+
+        self.nav2_action_name = self.NAV2_ACTION_NAME
+        self.map_frame = self.MAP_FRAME
+
+        self.minimum_goal_interval = self.MINIMUM_GOAL_INTERVAL_S
 
         self.latest_foraging_state = None
         self.active_goal = False
@@ -199,21 +209,74 @@ class RobotinoPolicyExecutor(Node):
         self.energy_before_policy = self.get_current_energy()
         self.reward_before_policy = self.get_current_reward()
 
+        target_x = float(policy.target_x_map)
+        target_y = float(policy.target_y_map)
+
+        robot_position = self.get_robot_position_from_state()
+
+        if robot_position is None:
+            self.get_logger().warn(
+                "No foraging state available yet. Falling back to raw policy target."
+            )
+
+            goal_x = target_x
+            goal_y = target_y
+            goal_yaw = float(policy.target_yaw_map)
+
+        else:
+            robot_x, robot_y = robot_position
+
+            distance_to_target = euclidean_distance(
+                robot_x,
+                robot_y,
+                target_x,
+                target_y,
+            )
+
+            self.get_logger().info(
+                f"Energy bank distance: {distance_to_target:.2f} m"
+            )
+
+            if distance_to_target <= ENERGY_INTERACTION_DISTANCE_M:
+                self.get_logger().info(
+                    "Already close enough to energy bank. Stopping robot."
+                )
+
+                self.stop_robot()
+
+                self.publish_simple_outcome(
+                    policy,
+                    True,
+                    True,
+                    "energy_bank_reached_interaction_distance",
+                )
+                return
+
+            goal_x, goal_y, goal_yaw = compute_approach_pose(
+                robot_x,
+                robot_y,
+                target_x,
+                target_y,
+                ENERGY_APPROACH_STANDOFF_M,
+                MIN_DISTANCE_EPSILON_M
+            )
+
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose.header.frame_id = self.map_frame
         goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
 
-        goal_msg.pose.pose.position.x = float(policy.target_x_map)
-        goal_msg.pose.pose.position.y = float(policy.target_y_map)
+        goal_msg.pose.pose.position.x = float(goal_x)
+        goal_msg.pose.pose.position.y = float(goal_y)
         goal_msg.pose.pose.position.z = 0.0
 
-        qz, qw = self.yaw_to_quaternion_z_w(float(policy.target_yaw_map))
+        qz, qw = yaw_to_quaternion_z_w(float(goal_yaw))
         goal_msg.pose.pose.orientation.z = qz
         goal_msg.pose.pose.orientation.w = qw
 
         self.get_logger().info(
-            f"Sending Nav2 goal for policy {policy.policy_name}: "
-            f"x={policy.target_x_map:.2f}, y={policy.target_y_map:.2f}"
+            f"Sending Nav2 energy approach goal for policy {policy.policy_name}: "
+            f"approach_x={goal_x:.2f}, approach_y={goal_y:.2f}, "
+            f"tag_x={target_x:.2f}, tag_y={target_y:.2f}, yaw={goal_yaw:.2f}"
         )
 
         if not self.nav2_client.wait_for_server(timeout_sec=2.0):
@@ -346,9 +409,15 @@ class RobotinoPolicyExecutor(Node):
         ) / 1e9
 
         return elapsed >= self.minimum_goal_interval
+    
+    def get_robot_position_from_state(self):
+        if self.latest_foraging_state is None:
+            return None
 
-    def yaw_to_quaternion_z_w(self, yaw):
-        return math.sin(yaw / 2.0), math.cos(yaw / 2.0)
+        return (
+            float(self.latest_foraging_state.robot_x_map),
+            float(self.latest_foraging_state.robot_y_map),
+        )
 
 
 def main(args=None):

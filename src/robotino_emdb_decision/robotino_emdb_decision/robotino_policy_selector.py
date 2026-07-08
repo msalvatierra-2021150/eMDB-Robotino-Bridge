@@ -44,14 +44,12 @@ class RobotinoPolicySelector(Node):
         self.default_target_yaw = float(
             self.get_parameter("default_target_yaw").value
         )
-
         self.subscriber = self.create_subscription(
             RobotinoMotivationState,
             self.input_topic,
             self.motivation_callback,
             10,
         )
-
         self.publisher = self.create_publisher(
             RobotinoSelectedPolicy,
             self.output_topic,
