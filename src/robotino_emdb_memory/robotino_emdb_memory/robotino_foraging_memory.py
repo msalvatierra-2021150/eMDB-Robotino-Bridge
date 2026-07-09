@@ -20,10 +20,10 @@ class RobotinoForagingMemory(Node):
         self.declare_parameter("output_topic", "/robotino/emdb/foraging_state")
 
         self.declare_parameter("initial_energy", 1.0)
-        self.declare_parameter("energy_decay_per_second", 0.005)
+        self.declare_parameter("energy_decay_per_second", 0.01)
         self.declare_parameter("low_energy_threshold", 0.35)
 
-        self.declare_parameter("arrival_distance", 0.45)
+        self.declare_parameter("arrival_distance", 0.70)
         self.declare_parameter("same_tag_event_gap", 3.0)
 
         self.input_topic = self.get_parameter("input_topic").value

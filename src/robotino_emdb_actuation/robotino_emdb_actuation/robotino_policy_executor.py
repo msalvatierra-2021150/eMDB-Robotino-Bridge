@@ -14,13 +14,16 @@ from robotino_emdb_interfaces.msg import (
     RobotinoForagingState,
 )
 
+from tf2_ros import Buffer, TransformListener, TransformException
+from rclpy.duration import Duration
+
 from robotino_emdb_actuation.navigation_geometry import (
     euclidean_distance,
     compute_approach_pose,
     yaw_to_quaternion_z_w,
 )
-ENERGY_APPROACH_STANDOFF_M = 0.25
-GOAL_APPROACH_STANDOFF_M = 0.30
+ENERGY_APPROACH_STANDOFF_M = 1.0
+GOAL_APPROACH_STANDOFF_M = 1.0
 
 ENERGY_INTERACTION_DISTANCE_M = 0.30
 GOAL_INTERACTION_DISTANCE_M = 0.35
@@ -65,6 +68,12 @@ class RobotinoPolicyExecutor(Node):
 
     def __init__(self):
         super().__init__("robotino_policy_executor")
+
+        self.declare_parameter("robot_base_frame", "base_link")
+        self.robot_base_frame = self.get_parameter("robot_base_frame").value
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Safety switch. Keep false until selected_policy looks correct.
         self.declare_parameter("enable_nav2_execution", False)
@@ -137,10 +146,26 @@ class RobotinoPolicyExecutor(Node):
             self.nav2_action_name,
         )
 
-        self.get_logger().info("Robotino policy executor started")
-        self.get_logger().info(f"Subscribing to: {self.policy_topic}")
-        self.get_logger().info(f"Publishing outcomes to: {self.outcome_topic}")
-        self.get_logger().info(f"Nav2 execution enabled: {self.enable_nav2_execution}")
+    def get_robot_position_from_tf(self):
+        try:
+            tf_msg = self.tf_buffer.lookup_transform(
+                self.map_frame,
+                self.robot_base_frame,
+                rclpy.time.Time(),  # latest available transform
+                timeout=Duration(seconds=0.2),
+            )
+
+            x = tf_msg.transform.translation.x
+            y = tf_msg.transform.translation.y
+
+            return float(x), float(y)
+
+        except TransformException as ex:
+            self.get_logger().warn(
+                f"Could not get current robot pose from TF "
+                f"{self.map_frame} <- {self.robot_base_frame}: {ex}"
+            )
+            return None
 
     def foraging_callback(self, msg: RobotinoForagingState):
         self.latest_foraging_state = msg
@@ -212,54 +237,57 @@ class RobotinoPolicyExecutor(Node):
         target_x = float(policy.target_x_map)
         target_y = float(policy.target_y_map)
 
-        robot_position = self.get_robot_position_from_state()
+        robot_position = self.get_robot_position_from_tf()
 
         if robot_position is None:
             self.get_logger().warn(
-                "No foraging state available yet. Falling back to raw policy target."
+                "No current robot TF pose available. Not sending Nav2 goal."
             )
 
-            goal_x = target_x
-            goal_y = target_y
-            goal_yaw = float(policy.target_yaw_map)
-
-        else:
-            robot_x, robot_y = robot_position
-
-            distance_to_target = euclidean_distance(
-                robot_x,
-                robot_y,
-                target_x,
-                target_y,
+            self.publish_simple_outcome(
+                policy,
+                False,
+                False,
+                "no_current_robot_tf_pose"
             )
+            return
 
+        robot_x, robot_y = robot_position
+
+        distance_to_target = euclidean_distance(
+            robot_x,
+            robot_y,
+            target_x,
+            target_y,
+        )
+
+        self.get_logger().info(
+            f"Energy bank distance using live TF: {distance_to_target:.2f} m"
+        )
+
+        if distance_to_target <= ENERGY_INTERACTION_DISTANCE_M:
             self.get_logger().info(
-                f"Energy bank distance: {distance_to_target:.2f} m"
+                "Already close enough to energy bank. Stopping robot."
             )
 
-            if distance_to_target <= ENERGY_INTERACTION_DISTANCE_M:
-                self.get_logger().info(
-                    "Already close enough to energy bank. Stopping robot."
-                )
+            self.stop_robot()
 
-                self.stop_robot()
-
-                self.publish_simple_outcome(
-                    policy,
-                    True,
-                    True,
-                    "energy_bank_reached_interaction_distance",
-                )
-                return
-
-            goal_x, goal_y, goal_yaw = compute_approach_pose(
-                robot_x,
-                robot_y,
-                target_x,
-                target_y,
-                ENERGY_APPROACH_STANDOFF_M,
-                MIN_DISTANCE_EPSILON_M
+            self.publish_simple_outcome(
+                policy,
+                True,
+                True,
+                "energy_bank_reached_interaction_distance",
             )
+            return
+
+        goal_x, goal_y, goal_yaw = compute_approach_pose(
+            robot_x,
+            robot_y,
+            target_x,
+            target_y,
+            ENERGY_APPROACH_STANDOFF_M,
+            MIN_DISTANCE_EPSILON_M,
+        )
 
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose.header.frame_id = self.map_frame
@@ -409,16 +437,6 @@ class RobotinoPolicyExecutor(Node):
         ) / 1e9
 
         return elapsed >= self.minimum_goal_interval
-    
-    def get_robot_position_from_state(self):
-        if self.latest_foraging_state is None:
-            return None
-
-        return (
-            float(self.latest_foraging_state.robot_x_map),
-            float(self.latest_foraging_state.robot_y_map),
-        )
-
 
 def main(args=None):
     rclpy.init(args=args)
