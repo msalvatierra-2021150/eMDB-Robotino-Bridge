@@ -228,39 +228,39 @@ def generate_launch_description():
             description='If true, publishes exploration enable/disable commands.'
         ),
 
-        # Nav2 arguments
-        DeclareLaunchArgument(
-            'start_nav2',
-            default_value='true',
-            description='If true, starts Nav2 bringup from this launch file.'
-        ),
+        # # Nav2 arguments
+        # DeclareLaunchArgument(
+        #     'start_nav2',
+        #     default_value='true',
+        #     description='If true, starts Nav2 bringup from this launch file.'
+        # ),
 
-        DeclareLaunchArgument(
-            'use_sim_time',
-            default_value='true',
-            description='Use simulation clock.'
-        ),
+        # DeclareLaunchArgument(
+        #     'use_sim_time',
+        #     default_value='true',
+        #     description='Use simulation clock.'
+        # ),
 
-        DeclareLaunchArgument(
-            'autostart',
-            default_value='true',
-            description='Automatically start Nav2 lifecycle nodes.'
-        ),
+        # DeclareLaunchArgument(
+        #     'autostart',
+        #     default_value='true',
+        #     description='Automatically start Nav2 lifecycle nodes.'
+        # ),
 
-        DeclareLaunchArgument(
-            'map',
-            default_value=default_map_file,
-            description='Full path to map YAML file for Nav2 localization.'
-        ),
+        # DeclareLaunchArgument(
+        #     'map',
+        #     default_value=default_map_file,
+        #     description='Full path to map YAML file for Nav2 localization.'
+        # ),
 
-        DeclareLaunchArgument(
-            'nav2_params_file',
-            default_value=default_nav2_params_file,
-            description='Full path to Nav2 parameters YAML file.'
-        ),
+        # DeclareLaunchArgument(
+        #     'nav2_params_file',
+        #     default_value=default_nav2_params_file,
+        #     description='Full path to Nav2 parameters YAML file.'
+        # ),
 
-        # 0. Start Nav2 first
-        nav2_bringup,
+        # # 0. Start Nav2 first
+        # nav2_bringup,
 
         # 1. Start AprilTag TF to e-MDB bridge
         TimerAction(

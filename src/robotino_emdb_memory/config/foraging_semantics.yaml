@@ -5,6 +5,7 @@ tags:
     capacity: 0.0
     collection_rate: 0.0
     regen_rate: 0.0
+    normal_vector: [0.0, -1.0, 0.0]   # example: north wall
 
   1:
     type: low_energy_bank
@@ -12,6 +13,7 @@ tags:
     capacity: 0.30
     collection_rate: 0.08
     regen_rate: 0.00
+    normal_vector: [1.0, 0.0, 0.0]    # example: west wall
 
   2:
     type: medium_energy_bank
@@ -19,6 +21,7 @@ tags:
     capacity: 0.50
     collection_rate: 0.12
     regen_rate: 0.00
+    normal_vector: [-1.0, 0.0, 0.0]   # example: east wall
 
   3:
     type: checkpoint
@@ -26,6 +29,7 @@ tags:
     capacity: 0.0
     collection_rate: 0.0
     regen_rate: 0.0
+    normal_vector: [0.0, 1.0, 0.0]    # example: south wall
 
   4:
     type: high_energy_bank
@@ -33,6 +37,7 @@ tags:
     capacity: 0.80
     collection_rate: 0.18
     regen_rate: 0.00
+    normal_vector: [0.0, -1.0, 0.0]   # example: north wall
 
   5:
     type: goal_marker
@@ -40,3 +45,4 @@ tags:
     capacity: 0.0
     collection_rate: 0.0
     regen_rate: 0.0
+    normal_vector: [0.0, 1.0, 0.0]    # example: south wall

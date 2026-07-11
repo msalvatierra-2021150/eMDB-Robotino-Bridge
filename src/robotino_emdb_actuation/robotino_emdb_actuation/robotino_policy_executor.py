@@ -22,11 +22,12 @@ from robotino_emdb_actuation.navigation_geometry import (
     compute_approach_pose,
     yaw_to_quaternion_z_w,
 )
+
 ENERGY_APPROACH_STANDOFF_M = 1.0
 GOAL_APPROACH_STANDOFF_M = 1.0
 
-ENERGY_INTERACTION_DISTANCE_M = 0.30
-GOAL_INTERACTION_DISTANCE_M = 0.35
+ENERGY_INTERACTION_DISTANCE_M = 0.9
+GOAL_INTERACTION_DISTANCE_M = 0.9
 
 MIN_DISTANCE_EPSILON_M = 0.001
 

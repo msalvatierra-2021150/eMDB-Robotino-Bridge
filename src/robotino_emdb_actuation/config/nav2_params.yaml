@@ -223,6 +223,7 @@ local_costmap:
       resolution: 0.03
 
       robot_radius: 0.175
+      footprint_padding: 0.0
 
       plugins: ["obstacle_layer", "inflation_layer"]
 
@@ -244,8 +245,11 @@ local_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 4.0
-        inflation_radius: 0.35
+        enabled: true
+        inflation_radius: 0.20
+        cost_scaling_factor: 15.0
+        inflate_unknown: false
+        inflate_around_unknown: false
 
       always_send_full_costmap: True
 
@@ -269,6 +273,7 @@ global_costmap:
       robot_base_frame: base_link
 
       robot_radius: 0.175
+      footprint_padding: 0.0
 
       # Use 0.05 if your saved map resolution is 0.05.
       # Keep 0.06 only if your map was generated at 0.06.
@@ -300,8 +305,11 @@ global_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 4.0
-        inflation_radius: 0.35
+        enabled: true
+        inflation_radius: 0.20
+        cost_scaling_factor: 15.0
+        inflate_unknown: false
+        inflate_around_unknown: false
 
       always_send_full_costmap: True
 
