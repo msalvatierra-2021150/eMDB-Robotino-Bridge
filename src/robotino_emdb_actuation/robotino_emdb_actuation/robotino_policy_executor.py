@@ -1,4 +1,5 @@
 import rclpy
+import math
 from rclpy.node import Node
 from rclpy.action import ActionClient
 
@@ -19,6 +20,9 @@ from robotino_emdb_actuation.navigation_geometry import (
     euclidean_distance,
     compute_approach_pose,
     yaw_to_quaternion_z_w,
+    normalize_angle,
+    quaternion_to_yaw
+
 )
 
 ENERGY_APPROACH_STANDOFF_M = 0.5
@@ -26,6 +30,9 @@ GOAL_APPROACH_STANDOFF_M = 0.5
 
 ENERGY_INTERACTION_DISTANCE_M = 0.55
 GOAL_INTERACTION_DISTANCE_M = 0.55
+
+OBSERVATION_POSITION_TOLERANCE_M = 0.05
+OBSERVATION_YAW_TOLERANCE_RAD = math.radians(10.0)
 
 MIN_DISTANCE_EPSILON_M = 0.001
 
@@ -160,6 +167,31 @@ class RobotinoPolicyExecutor(Node):
                 f"{self.map_frame} <- {self.robot_base_frame}: {ex}"
             )
             return None
+        
+    def get_robot_pose_from_tf(self):
+        try:
+            tf_msg = self.tf_buffer.lookup_transform(
+                self.map_frame,
+                self.robot_base_frame,
+                rclpy.time.Time(),
+                timeout=Duration(seconds=0.2),
+            )
+
+            x = float(tf_msg.transform.translation.x)
+            y = float(tf_msg.transform.translation.y)
+
+            yaw = quaternion_to_yaw(
+                tf_msg.transform.rotation
+            )
+
+            return x, y, yaw
+
+        except TransformException as ex:
+            self.get_logger().warn(
+                f"Could not get current robot pose from TF "
+                f"{self.map_frame} <- {self.robot_base_frame}: {ex}"
+            )
+            return None
 
     def foraging_callback(self, msg: RobotinoForagingState):
         self.latest_foraging_state = msg
@@ -264,9 +296,9 @@ class RobotinoPolicyExecutor(Node):
         # Option 1: preserve the orientation from the successful observation.
         goal_yaw = float(policy.last_seen_robot_yaw_map)
 
-        robot_position = self.get_robot_position_from_tf()
+        robot_pose = self.get_robot_pose_from_tf()
 
-        if robot_position is None:
+        if robot_pose is None:
             self.get_logger().warn(
                 "No current robot TF pose available. Not sending Nav2 goal."
             )
@@ -279,7 +311,7 @@ class RobotinoPolicyExecutor(Node):
             )
             return
 
-        robot_x, robot_y = robot_position
+        robot_x, robot_y, robot_yaw = robot_pose
 
         distance_to_observation_pose = euclidean_distance(
             robot_x,
@@ -288,26 +320,45 @@ class RobotinoPolicyExecutor(Node):
             goal_y,
         )
 
-        self.get_logger().info(
-            f"Distance to last successful observation pose: "
-            f"{distance_to_observation_pose:.2f} m"
+        yaw_error = abs(
+            normalize_angle(goal_yaw - robot_yaw)
         )
 
-        # Check arrival relative to the observation pose, not the tag itself.
-        if distance_to_observation_pose <= interaction_distance:
+        self.get_logger().info(
+            "Observation-pose error: "
+            f"robot=({robot_x:.3f}, {robot_y:.3f}, "
+            f"yaw={robot_yaw:.3f}), "
+            f"goal=({goal_x:.3f}, {goal_y:.3f}, "
+            f"yaw={goal_yaw:.3f}), "
+            f"distance={distance_to_observation_pose:.3f} m, "
+            f"yaw_error={math.degrees(yaw_error):.1f} deg"
+        )
+
+        position_reached = (
+            distance_to_observation_pose
+            <= OBSERVATION_POSITION_TOLERANCE_M
+        )
+
+        orientation_reached = (
+            yaw_error
+            <= OBSERVATION_YAW_TOLERANCE_RAD
+        )
+
+        if position_reached and orientation_reached:
             self.get_logger().info(
-                "Already near the last successful tag-observation pose."
+                "Remembered observation pose reached accurately."
             )
 
             self.stop_robot()
 
-            # Do not claim the energy bank itself was reached yet.
-            # The camera must verify the expected tag.
-            self.publish_simple_outcome(
+            # This means only that the viewpoint was reached.
+            # It does not yet mean that the energy bank was recovered.
+            self.publish_policy_outcome(
                 policy,
-                True,
-                True,
-                "last_observation_pose_reached",
+                started=True,
+                finished=False,
+                success=False,
+                status="observation_pose_reached_verifying_tag",
             )
             return
 

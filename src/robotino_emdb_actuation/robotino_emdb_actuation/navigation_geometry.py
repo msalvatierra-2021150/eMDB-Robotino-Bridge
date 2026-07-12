@@ -36,3 +36,20 @@ def compute_approach_pose(robot_x, robot_y, target_x, target_y, standoff, epsilo
     )
 
     return goal_x, goal_y, goal_yaw
+
+def normalize_angle(angle):
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def quaternion_to_yaw(quaternion):
+    sin_yaw = 2.0 * (
+        quaternion.w * quaternion.z
+        + quaternion.x * quaternion.y
+    )
+
+    cos_yaw = 1.0 - 2.0 * (
+        quaternion.y * quaternion.y
+        + quaternion.z * quaternion.z
+    )
+
+    return math.atan2(sin_yaw, cos_yaw)
