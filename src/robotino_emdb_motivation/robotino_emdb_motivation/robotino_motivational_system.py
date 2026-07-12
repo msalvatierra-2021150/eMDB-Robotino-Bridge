@@ -130,13 +130,23 @@ class RobotinoMotivationalSystem(Node):
         motivation.suggested_policy = policy_name
 
         motivation.dominant_drive_id = int(drive_id)
-        motivation.dominant_drive = drive_name
-
-        motivation.suggested_goal = suggested_goal
 
         motivation.target_tag_id = int(msg.best_energy_tag_id)
         motivation.target_x_map = float(msg.best_energy_x_map)
         motivation.target_y_map = float(msg.best_energy_y_map)
+
+        if policy_id == self.POLICY_RETURN_TO_BEST_ENERGY_BANK:
+            motivation.last_seen_robot_x_map = float(msg.best_energy_last_seen_robot_x_map)
+            motivation.last_seen_robot_y_map = float(msg.best_energy_last_seen_robot_y_map)
+            motivation.last_seen_robot_yaw_map = float(msg.best_energy_last_seen_robot_yaw_map)
+        else:
+            motivation.last_seen_robot_x_map = float(msg.last_seen_robot_x_map)
+            motivation.last_seen_robot_y_map = float(msg.last_seen_robot_y_map)
+            motivation.last_seen_robot_yaw_map = float(msg.last_seen_robot_yaw_map)
+
+        motivation.dominant_drive = drive_name
+
+        motivation.suggested_goal = suggested_goal
 
         motivation.priority_confidence = self.compute_priority_confidence(
             exploration_priority,

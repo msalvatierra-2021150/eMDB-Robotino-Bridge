@@ -21,3 +21,7 @@ float32 priority_confidence
 bool execute_now
 bool use_nav2
 bool interrupt_exploration
+
+float32 last_seen_robot_x_map
+float32 last_seen_robot_y_map
+float32 last_seen_robot_yaw_map

@@ -66,6 +66,10 @@ class RobotinoPolicySelector(Node):
         policy.header = msg.header
         policy.valid = bool(msg.valid)
 
+        policy.last_seen_robot_x_map = float(msg.last_seen_robot_x_map)
+        policy.last_seen_robot_y_map = float(msg.last_seen_robot_y_map)
+        policy.last_seen_robot_yaw_map = float(msg.last_seen_robot_yaw_map)
+
         policy.policy_id = int(msg.suggested_policy_id)
         policy.policy_name = str(msg.suggested_policy)
 

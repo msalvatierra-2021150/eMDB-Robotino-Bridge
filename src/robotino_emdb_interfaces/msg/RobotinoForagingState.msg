@@ -43,3 +43,11 @@ float32 best_energy_y_map
 float32 best_energy_score
 
 bool goal_satisfied
+
+float32 last_seen_robot_x_map
+float32 last_seen_robot_y_map
+float32 last_seen_robot_yaw_map
+
+float32 best_energy_last_seen_robot_x_map
+float32 best_energy_last_seen_robot_y_map
+float32 best_energy_last_seen_robot_yaw_map

@@ -1,5 +1,3 @@
-import math
-
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
@@ -23,11 +21,11 @@ from robotino_emdb_actuation.navigation_geometry import (
     yaw_to_quaternion_z_w,
 )
 
-ENERGY_APPROACH_STANDOFF_M = 1.0
-GOAL_APPROACH_STANDOFF_M = 1.0
+ENERGY_APPROACH_STANDOFF_M = 0.5
+GOAL_APPROACH_STANDOFF_M = 0.5
 
-ENERGY_INTERACTION_DISTANCE_M = 0.9
-GOAL_INTERACTION_DISTANCE_M = 0.9
+ENERGY_INTERACTION_DISTANCE_M = 0.55
+GOAL_INTERACTION_DISTANCE_M = 0.55
 
 MIN_DISTANCE_EPSILON_M = 0.001
 
@@ -53,14 +51,14 @@ class RobotinoPolicyExecutor(Node):
     POLICY_INSPECT_VISIBLE_TAG = 1
     POLICY_RETURN_TO_BEST_ENERGY_BANK = 2
     POLICY_SEARCH_FOR_ENERGY = 3
-    POLICY_GOAL_REACHED = 4
+    POLICY_GOAL = 4
 
     POLICY_TOPIC = "/robotino/emdb/selected_policy"
     FORAGING_TOPIC = "/robotino/emdb/foraging_state"
     OUTCOME_TOPIC = "/robotino/emdb/policy_outcome"
 
     CMD_VEL_TOPIC = "/cmd_vel"
-    EXPLORATION_ENABLE_TOPIC = "/robotino/emdb/exploration_enable"
+    EXPLORATION_ENABLE_TOPIC = "/robotino/emdb/frontier_exploration_enable"
 
     NAV2_ACTION_NAME = "navigate_to_pose"
     MAP_FRAME = "map"
@@ -69,6 +67,8 @@ class RobotinoPolicyExecutor(Node):
 
     def __init__(self):
         super().__init__("robotino_policy_executor")
+        
+        self.active_goal_handle = None
 
         self.declare_parameter("robot_base_frame", "base_link")
         self.robot_base_frame = self.get_parameter("robot_base_frame").value
@@ -78,17 +78,6 @@ class RobotinoPolicyExecutor(Node):
 
         # Safety switch. Keep false until selected_policy looks correct.
         self.declare_parameter("enable_nav2_execution", False)
-
-        # If true, publishes Bool to exploration_enable_topic.
-        # You can later connect this to your frontier exploration manager.
-        self.declare_parameter("publish_exploration_control", False)
-
-        self.enable_nav2_execution = bool(
-            self.get_parameter("enable_nav2_execution").value
-        )
-        self.publish_exploration_control = bool(
-            self.get_parameter("publish_exploration_control").value
-        )
 
         self.policy_topic = self.POLICY_TOPIC
         self.foraging_topic = self.FORAGING_TOPIC
@@ -108,6 +97,16 @@ class RobotinoPolicyExecutor(Node):
         self.current_policy = None
         self.energy_before_policy = 0.0
         self.reward_before_policy = 0.0
+
+        self.enable_nav2_execution = bool(
+            self.get_parameter("enable_nav2_execution").value
+        )
+
+        self.exploration_enable_publisher = self.create_publisher(
+            Bool,
+            self.exploration_enable_topic,
+            10,
+        )
 
         self.policy_subscriber = self.create_subscription(
             RobotinoSelectedPolicy,
@@ -132,12 +131,6 @@ class RobotinoPolicyExecutor(Node):
         self.cmd_vel_publisher = self.create_publisher(
             Twist,
             self.cmd_vel_topic,
-            10,
-        )
-
-        self.exploration_enable_publisher = self.create_publisher(
-            Bool,
-            self.exploration_enable_topic,
             10,
         )
 
@@ -190,15 +183,17 @@ class RobotinoPolicyExecutor(Node):
         elif msg.policy_id == self.POLICY_RETURN_TO_BEST_ENERGY_BANK:
             self.execute_return_to_best_energy_bank(msg)
 
-        elif msg.policy_id == self.POLICY_GOAL_REACHED:
-            self.execute_goal_reached(msg)
+        elif msg.policy_id == self.POLICY_GOAL:
+            self.execute_goal(msg)
 
     def execute_continue_exploring(self, policy):
         self.set_exploration_enabled(True)
+        self.cancel_active_navigation()
         self.publish_simple_outcome(policy, True, True, "continuing_exploration")
 
     def execute_search_for_energy(self, policy):
         self.set_exploration_enabled(True)
+        self.cancel_active_navigation()
         self.publish_simple_outcome(policy, True, True, "searching_for_energy")
 
     def execute_inspect_visible_tag(self, policy):
@@ -206,29 +201,53 @@ class RobotinoPolicyExecutor(Node):
         self.stop_robot()
         self.publish_simple_outcome(policy, True, True, "inspecting_visible_tag")
 
-    def execute_goal_reached(self, policy):
-        self.set_exploration_enabled(False)
-        self.stop_robot()
-        self.publish_simple_outcome(policy, True, True, "goal_reached_stopping_robot")
+    def execute_goal(self, policy):
+        self.nav_planning(policy, GOAL_INTERACTION_DISTANCE_M, GOAL_APPROACH_STANDOFF_M)       
 
     def execute_return_to_best_energy_bank(self, policy):
-        self.set_exploration_enabled(False)
+        self.nav_planning(policy, ENERGY_INTERACTION_DISTANCE_M, ENERGY_APPROACH_STANDOFF_M)
 
+    def nav_planning(
+        self,
+        policy,
+        interaction_distance,
+        approach_standoff_distance,
+    ):
+        # Any policy-controlled Nav2 movement must stop frontier exploration.
+        self.set_exploration_enabled(False)
+        
         if not policy.use_nav2:
-            self.publish_simple_outcome(policy, False, False, "policy_does_not_use_nav2")
+            self.publish_simple_outcome(
+                policy,
+                False,
+                False,
+                "policy_does_not_use_nav2",
+            )
             return
 
         if not self.enable_nav2_execution:
             self.get_logger().warn(
-                "Nav2 execution is disabled. Set enable_nav2_execution:=true to send goals."
+                "Nav2 execution is disabled. "
+                "Set enable_nav2_execution:=true to send goals."
             )
-            self.publish_simple_outcome(policy, False, False, "dry_run_nav2_disabled")
+            self.publish_simple_outcome(
+                policy,
+                False,
+                False,
+                "dry_run_nav2_disabled",
+            )
             return
 
         if self.active_goal:
+            self.get_logger().debug(
+                "A Nav2 goal is already active. Ignoring repeated policy."
+            )
             return
 
         if not self.goal_interval_ok():
+            self.get_logger().debug(
+                "Ignoring policy because minimum goal interval has not elapsed."
+            )
             return
 
         self.current_policy = policy
@@ -237,6 +256,13 @@ class RobotinoPolicyExecutor(Node):
 
         target_x = float(policy.target_x_map)
         target_y = float(policy.target_y_map)
+
+        # Navigate first to the robot pose from which the tag was last observed.
+        goal_x = float(policy.last_seen_robot_x_map)
+        goal_y = float(policy.last_seen_robot_y_map)
+
+        # Option 1: preserve the orientation from the successful observation.
+        goal_yaw = float(policy.last_seen_robot_yaw_map)
 
         robot_position = self.get_robot_position_from_tf()
 
@@ -249,78 +275,97 @@ class RobotinoPolicyExecutor(Node):
                 policy,
                 False,
                 False,
-                "no_current_robot_tf_pose"
+                "no_current_robot_tf_pose",
             )
             return
 
         robot_x, robot_y = robot_position
 
-        distance_to_target = euclidean_distance(
+        distance_to_observation_pose = euclidean_distance(
             robot_x,
             robot_y,
-            target_x,
-            target_y,
+            goal_x,
+            goal_y,
         )
 
         self.get_logger().info(
-            f"Energy bank distance using live TF: {distance_to_target:.2f} m"
+            f"Distance to last successful observation pose: "
+            f"{distance_to_observation_pose:.2f} m"
         )
 
-        if distance_to_target <= ENERGY_INTERACTION_DISTANCE_M:
+        # Check arrival relative to the observation pose, not the tag itself.
+        if distance_to_observation_pose <= interaction_distance:
             self.get_logger().info(
-                "Already close enough to energy bank. Stopping robot."
+                "Already near the last successful tag-observation pose."
             )
 
             self.stop_robot()
 
+            # Do not claim the energy bank itself was reached yet.
+            # The camera must verify the expected tag.
             self.publish_simple_outcome(
                 policy,
                 True,
                 True,
-                "energy_bank_reached_interaction_distance",
+                "last_observation_pose_reached",
             )
             return
 
-        goal_x, goal_y, goal_yaw = compute_approach_pose(
-            robot_x,
-            robot_y,
-            target_x,
-            target_y,
-            ENERGY_APPROACH_STANDOFF_M,
-            MIN_DISTANCE_EPSILON_M,
-        )
-
         goal_msg = NavigateToPose.Goal()
+
         goal_msg.pose.header.frame_id = self.map_frame
         goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
 
-        goal_msg.pose.pose.position.x = float(goal_x)
-        goal_msg.pose.pose.position.y = float(goal_y)
+        goal_msg.pose.pose.position.x = goal_x
+        goal_msg.pose.pose.position.y = goal_y
         goal_msg.pose.pose.position.z = 0.0
 
-        qz, qw = yaw_to_quaternion_z_w(float(goal_yaw))
+        qz, qw = yaw_to_quaternion_z_w(goal_yaw)
+
+        goal_msg.pose.pose.orientation.x = 0.0
+        goal_msg.pose.pose.orientation.y = 0.0
         goal_msg.pose.pose.orientation.z = qz
         goal_msg.pose.pose.orientation.w = qw
 
         self.get_logger().info(
-            f"Sending Nav2 energy approach goal for policy {policy.policy_name}: "
-            f"approach_x={goal_x:.2f}, approach_y={goal_y:.2f}, "
-            f"tag_x={target_x:.2f}, tag_y={target_y:.2f}, yaw={goal_yaw:.2f}"
+            f"Sending Nav2 goal to last successful observation pose for "
+            f"policy {policy.policy_name}: "
+            f"observation_x={goal_x:.2f}, "
+            f"observation_y={goal_y:.2f}, "
+            f"observation_yaw={goal_yaw:.2f}, "
+            f"tag_x={target_x:.2f}, "
+            f"tag_y={target_y:.2f}"
         )
 
         if not self.nav2_client.wait_for_server(timeout_sec=2.0):
-            self.get_logger().error("Nav2 NavigateToPose action server not available")
-            self.publish_simple_outcome(policy, False, False, "nav2_server_unavailable")
+            self.get_logger().error(
+                "Nav2 NavigateToPose action server not available"
+            )
+
+            self.publish_simple_outcome(
+                policy,
+                False,
+                False,
+                "nav2_server_unavailable",
+            )
             return
 
         self.active_goal = True
         self.last_goal_time = self.get_clock().now()
 
         send_future = self.nav2_client.send_goal_async(goal_msg)
-        send_future.add_done_callback(self.nav2_goal_response_callback)
+        send_future.add_done_callback(
+            self.nav2_goal_response_callback
+        )
 
     def nav2_goal_response_callback(self, future):
-        goal_handle = future.result()
+        try:
+            goal_handle = future.result()
+        except Exception as ex:
+            self.get_logger().error(f"Failed to send Nav2 goal: {ex}")
+            self.active_goal = False
+            self.current_policy = None
+            return
 
         if not goal_handle.accepted:
             self.get_logger().warn("Nav2 goal rejected")
@@ -329,12 +374,15 @@ class RobotinoPolicyExecutor(Node):
             if self.current_policy is not None:
                 self.publish_simple_outcome(
                     self.current_policy,
-                    True,
+                    False,
                     False,
                     "nav2_goal_rejected",
                 )
 
+            self.current_policy = None
             return
+
+        self.active_goal_handle = goal_handle
 
         self.get_logger().info("Nav2 goal accepted")
 
@@ -417,11 +465,9 @@ class RobotinoPolicyExecutor(Node):
         return float(self.latest_foraging_state.total_reward)
 
     def set_exploration_enabled(self, enabled):
-        if not self.publish_exploration_control:
-            return
-
         msg = Bool()
         msg.data = bool(enabled)
+
         self.exploration_enable_publisher.publish(msg)
 
     def stop_robot(self):
@@ -438,6 +484,14 @@ class RobotinoPolicyExecutor(Node):
         ) / 1e9
 
         return elapsed >= self.minimum_goal_interval
+    
+    def cancel_active_navigation(self):
+        if self.active_goal_handle is None:
+            return
+
+        self.active_goal_handle.cancel_goal_async()
+        self.active_goal_handle = None
+        self.active_goal = False
 
 def main(args=None):
     rclpy.init(args=args)

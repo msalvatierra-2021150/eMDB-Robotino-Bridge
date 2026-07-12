@@ -27,3 +27,7 @@ float32 search_energy_priority
 
 bool should_interrupt_exploration
 bool should_send_nav_goal
+
+float32 last_seen_robot_x_map
+float32 last_seen_robot_y_map
+float32 last_seen_robot_yaw_map
