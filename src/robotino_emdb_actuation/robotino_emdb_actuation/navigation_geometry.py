@@ -9,30 +9,64 @@ def euclidean_distance(x1, y1, x2, y2):
     return math.sqrt(dx * dx + dy * dy)
 
 
-def compute_approach_pose(robot_x, robot_y, target_x, target_y, standoff, epsilon):
+import math
+
+
+def compute_tag_approach_pose(
+    robot_x,
+    robot_y,
+    tag_x,
+    tag_y,
+    normal_x,
+    normal_y,
+    standoff=0.65,
+):
     """
-    Compute a Nav2 approach pose for a remembered target.
+    Returns:
+        goal_x, goal_y, goal_yaw
 
-    The target is the actual tag/object position in map frame.
-    The output is the pose where the robot should stand.
+    standoff is the distance between the tag/wall and base_link.
     """
 
-    dx = float(target_x) - float(robot_x)
-    dy = float(target_y) - float(robot_y)
-    dist = math.sqrt(dx * dx + dy * dy)
+    normal_length = math.hypot(normal_x, normal_y)
 
-    if dist < epsilon:
-        return float(robot_x), float(robot_y), 0.0
+    if normal_length < 1e-6:
+        raise ValueError("Tag normal vector has zero length")
 
-    ux = dx / dist
-    uy = dy / dist
+    normal_x /= normal_length
+    normal_y /= normal_length
 
-    goal_x = float(target_x) - float(standoff) * ux
-    goal_y = float(target_y) - float(standoff) * uy
+    # Two possible sides of the tag.
+    candidate_1 = (
+        tag_x + standoff * normal_x,
+        tag_y + standoff * normal_y,
+    )
 
+    candidate_2 = (
+        tag_x - standoff * normal_x,
+        tag_y - standoff * normal_y,
+    )
+
+    # Initially select the candidate on the robot's side of the wall.
+    distance_1 = math.hypot(
+        candidate_1[0] - robot_x,
+        candidate_1[1] - robot_y,
+    )
+
+    distance_2 = math.hypot(
+        candidate_2[0] - robot_x,
+        candidate_2[1] - robot_y,
+    )
+
+    if distance_1 <= distance_2:
+        goal_x, goal_y = candidate_1
+    else:
+        goal_x, goal_y = candidate_2
+
+    # Make the robot face the tag when it reaches the goal.
     goal_yaw = math.atan2(
-        float(target_y) - goal_y,
-        float(target_x) - goal_x,
+        tag_y - goal_y,
+        tag_x - goal_x,
     )
 
     return goal_x, goal_y, goal_yaw
@@ -53,3 +87,6 @@ def quaternion_to_yaw(quaternion):
     )
 
     return math.atan2(sin_yaw, cos_yaw)
+
+def yaw_to_quaternion_z_w(yaw):
+    return math.sin(yaw / 2.0), math.cos(yaw / 2.0)
