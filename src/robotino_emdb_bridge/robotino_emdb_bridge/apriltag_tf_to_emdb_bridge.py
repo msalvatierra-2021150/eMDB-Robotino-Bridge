@@ -11,6 +11,7 @@ from robotino_emdb_interfaces.msg import RobotinoTag
 from rclpy.time import Time
 from tf2_ros import Buffer, TransformListener, TransformException
 
+from rclpy.executors import MultiThreadedExecutor
 
 class AprilTagTFToEMDBBridge(Node):
     def __init__(self):
@@ -244,12 +245,13 @@ class AprilTagTFToEMDBBridge(Node):
                 target_frame,
                 source_frame,
                 lookup_time,
-                timeout=Duration(seconds=0.2),
+                timeout=Duration(seconds=0.5),
             )
 
         except TransformException as error:
             self.get_logger().warn(
-                f"Could not transform {target_frame} <- {source_frame}: {error}",
+                f"Could not transform "
+                f"{target_frame} <- {source_frame}: {error}",
                 throttle_duration_sec=2.0,
             )
             return None
@@ -302,14 +304,17 @@ def main(args=None):
 
     node = AprilTagTFToEMDBBridge()
 
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
+
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
-
-    node.destroy_node()
-    rclpy.shutdown()
-
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == "__main__":
     main()
