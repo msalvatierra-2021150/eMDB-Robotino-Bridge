@@ -6,9 +6,10 @@ from rclpy.duration import Duration
 
 from apriltag_msgs.msg import AprilTagDetectionArray
 
-from tf2_ros import Buffer, TransformListener
-
 from robotino_emdb_interfaces.msg import RobotinoTag
+
+from rclpy.time import Time
+from tf2_ros import Buffer, TransformListener, TransformException
 
 
 class AprilTagTFToEMDBBridge(Node):
@@ -70,101 +71,145 @@ class AprilTagTFToEMDBBridge(Node):
     def detections_callback(self, msg: AprilTagDetectionArray):
         detections = list(msg.detections)
 
-        if len(detections) == 0:
+        if not detections:
             if self.publish_empty_detection:
-                self.publish_empty()
+                self.publish_empty(msg.header.stamp)
             return
 
         detection = self.select_detection(detections)
 
         if detection is None:
             if self.publish_empty_detection:
-                self.publish_empty()
+                self.publish_empty(msg.header.stamp)
             return
 
         tag_id = int(detection.id)
         tag_frame = f"tag_{tag_id}"
 
+        # All transforms for this observation should use the same timestamp.
+        lookup_time = Time.from_msg(msg.header.stamp)
+
+        # ---------------------------------------------------------
+        # Obtain every required transform first.
+        # ---------------------------------------------------------
+        camera_to_tag = self.lookup_transform_safe(
+            self.camera_frame,
+            tag_frame,
+            lookup_time,
+        )
+
+        map_to_tag = self.lookup_transform_safe(
+            self.map_frame,
+            tag_frame,
+            lookup_time,
+        )
+
+        map_to_robot = self.lookup_transform_safe(
+            self.map_frame,
+            self.robot_frame,
+            lookup_time,
+        )
+
+        # Never publish a visible tag with incomplete or fake coordinates.
+        if (
+            camera_to_tag is None
+            or map_to_tag is None
+            or map_to_robot is None
+        ):
+            self.get_logger().warn(
+                f"Skipping tag {tag_id}: incomplete TF chain",
+                throttle_duration_sec=2.0,
+            )
+
+            if self.publish_empty_detection:
+                self.publish_empty(msg.header.stamp)
+
+            return
+
         output = RobotinoTag()
-        output.header = msg.header
+
+        # The principal coordinates published by this message are in map.
+        output.header.stamp = msg.header.stamp
+        output.header.frame_id = self.map_frame
+
         output.visible = True
         output.tag_id = tag_id
         output.family = str(detection.family)
 
         output.confidence = self.clamp(
-            float(detection.decision_margin) / self.confidence_margin_max,
+            float(detection.decision_margin)
+            / self.confidence_margin_max,
             0.0,
             1.0,
         )
 
         # ---------------------------------------------------------
-        # 1. Camera → Tag
-        # This gives distance and bearing.
+        # 1. Camera -> Tag
         # ---------------------------------------------------------
-        camera_to_tag = self.lookup_transform_safe(
-            self.camera_frame,
-            tag_frame,
+        tx = float(camera_to_tag.transform.translation.x)
+        ty = float(camera_to_tag.transform.translation.y)
+        tz = float(camera_to_tag.transform.translation.z)
+
+        output.tag_x_camera = tx
+        output.tag_y_camera = ty
+        output.tag_z_camera = tz
+
+        # camera_optical_frame convention:
+        # +x is right and +z is forward.
+        #
+        # ROS planar convention:
+        # positive angular bearing is left/counterclockwise.
+        output.bearing = math.atan2(-tx, tz)
+
+        # ---------------------------------------------------------
+        # 2. Map -> Tag
+        #
+        # This already incorporates:
+        # map -> base_link
+        # base_link -> camera
+        # camera -> tag
+        #
+        # Therefore, the 0.05 m camera offset is already included.
+        # ---------------------------------------------------------
+        output.tag_x_map = float(
+            map_to_tag.transform.translation.x
+        )
+        output.tag_y_map = float(
+            map_to_tag.transform.translation.y
+        )
+        output.tag_yaw_map = self.yaw_from_quaternion(
+            map_to_tag.transform.rotation
         )
 
-        if camera_to_tag is not None:
-            tx = float(camera_to_tag.transform.translation.x)
-            ty = float(camera_to_tag.transform.translation.y)
-            tz = float(camera_to_tag.transform.translation.z)
-
-            output.tag_x_camera = tx
-            output.tag_y_camera = ty
-            output.tag_z_camera = tz
-
-            output.distance = math.sqrt(tx * tx + ty * ty + tz * tz)
-
-            # In camera optical frame, z is usually forward and x is left/right.
-            output.bearing = math.atan2(tx, tz)
-        else:
-            output.tag_x_camera = 0.0
-            output.tag_y_camera = 0.0
-            output.tag_z_camera = 0.0
-            output.distance = 0.0
-            output.bearing = 0.0
-
         # ---------------------------------------------------------
-        # 2. Map → Tag
-        # This is the semantic-map location of the tag.
+        # 3. Map -> Robot
         # ---------------------------------------------------------
-        map_to_tag = self.lookup_transform_safe(
-            self.map_frame,
-            tag_frame,
+        output.robot_x_map = float(
+            map_to_robot.transform.translation.x
+        )
+        output.robot_y_map = float(
+            map_to_robot.transform.translation.y
+        )
+        output.robot_yaw_map = self.yaw_from_quaternion(
+            map_to_robot.transform.rotation
         )
 
-        if map_to_tag is not None:
-            output.tag_x_map = float(map_to_tag.transform.translation.x)
-            output.tag_y_map = float(map_to_tag.transform.translation.y)
-            output.tag_yaw_map = self.yaw_from_quaternion(
-                map_to_tag.transform.rotation
-            )
-        else:
-            output.tag_x_map = 0.0
-            output.tag_y_map = 0.0
-            output.tag_yaw_map = 0.0
+        # ---------------------------------------------------------
+        # 4. Planar base_link -> tag distance
+        #
+        # This is better for navigation than the 3D camera-to-tag
+        # distance because it ignores height difference.
+        # ---------------------------------------------------------
+        dx_map = output.tag_x_map - output.robot_x_map
+        dy_map = output.tag_y_map - output.robot_y_map
 
-        # ---------------------------------------------------------
-        # 3. Map → Robot
-        # This is where the robot was when it observed the tag.
-        # ---------------------------------------------------------
-        map_to_robot = self.lookup_transform_safe(
-            self.map_frame,
-            self.robot_frame,
+        output.distance = math.hypot(dx_map, dy_map)
+
+        tag_direction_map = math.atan2(dy_map, dx_map)
+
+        output.bearing = self.normalize_angle(
+            tag_direction_map - output.robot_yaw_map
         )
-
-        if map_to_robot is not None:
-            output.robot_x_map = float(map_to_robot.transform.translation.x)
-            output.robot_y_map = float(map_to_robot.transform.translation.y)
-            output.robot_yaw_map = self.yaw_from_quaternion(
-                map_to_robot.transform.rotation
-            )
-        else:
-            output.robot_x_map = 0.0
-            output.robot_y_map = 0.0
-            output.robot_yaw_map = 0.0
 
         self.publisher.publish(output)
 
@@ -188,22 +233,28 @@ class AprilTagTFToEMDBBridge(Node):
             key=lambda d: float(d.decision_margin),
         )
 
-    def lookup_transform_safe(self, target_frame, source_frame):
+    def lookup_transform_safe(
+        self,
+        target_frame,
+        source_frame,
+        lookup_time,
+    ):
         try:
             return self.tf_buffer.lookup_transform(
                 target_frame,
                 source_frame,
-                rclpy.time.Time(),
+                lookup_time,
                 timeout=Duration(seconds=0.2),
             )
-        except Exception as error:
+
+        except TransformException as error:
             self.get_logger().warn(
                 f"Could not transform {target_frame} <- {source_frame}: {error}",
                 throttle_duration_sec=2.0,
             )
             return None
 
-    def publish_empty(self):
+    def publish_empty(self, stamp=None):
         output = RobotinoTag()
 
         output.visible = False
@@ -211,7 +262,6 @@ class AprilTagTFToEMDBBridge(Node):
         output.family = ""
 
         output.confidence = 0.0
-
         output.distance = 0.0
         output.bearing = 0.0
 
@@ -227,8 +277,12 @@ class AprilTagTFToEMDBBridge(Node):
         output.robot_y_map = 0.0
         output.robot_yaw_map = 0.0
 
-        output.header.stamp = self.get_clock().now().to_msg()
-        output.header.frame_id = self.camera_frame
+        if stamp is not None:
+            output.header.stamp = stamp
+        else:
+            output.header.stamp = self.get_clock().now().to_msg()
+
+        output.header.frame_id = self.map_frame
 
         self.publisher.publish(output)
 
@@ -240,6 +294,8 @@ class AprilTagTFToEMDBBridge(Node):
     def clamp(self, value, min_value, max_value):
         return float(max(min_value, min(max_value, value)))
 
+    def normalize_angle(self, angle):
+        return float(math.atan2(math.sin(angle), math.cos(angle)))
 
 def main(args=None):
     rclpy.init(args=args)

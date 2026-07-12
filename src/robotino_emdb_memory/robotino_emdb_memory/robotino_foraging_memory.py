@@ -233,7 +233,7 @@ class RobotinoForagingMemory(Node):
                 median_x = statistics.median(sample[0] for sample in samples)
                 median_y = statistics.median(sample[1] for sample in samples)
                 error_from_median = math.hypot(
-                    measurement_x - median_x - 0.05,
+                    measurement_x - median_x ,
                     measurement_y - median_y,
                 )
                 accept_measurement = (
