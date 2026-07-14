@@ -1,2 +1,0 @@
-from robotino_emdb_interfaces.msg import RobotinoPolicyOutcome
-

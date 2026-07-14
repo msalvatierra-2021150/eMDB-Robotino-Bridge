@@ -3,12 +3,13 @@
 <package format="3">
   <name>robotino_emdb_decision</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Robotino adapters for official GII e-MDB policy execution.</description>
   <maintainer email="salvmike0@gmail.com">mike</maintainer>
-  <license>TODO: License declaration</license>
+  <license>MIT</license>
 
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
+  <depend>cognitive_node_interfaces</depend>
   <depend>robotino_emdb_interfaces</depend>
 
   <test_depend>ament_copyright</test_depend>

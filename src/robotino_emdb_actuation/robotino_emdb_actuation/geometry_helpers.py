@@ -14,9 +14,6 @@ from tf2_ros import TransformException
 
 from geometry_msgs.msg import PoseStamped
 
-from robotino_emdb_actuation.navigation_geometry import (
-    yaw_to_quaternion_z_w,
-)
 from robotino_emdb_interfaces.msg import RobotinoSelectedPolicy
 
 MIN_DISTANCE_EPSILON_M = 0.001
@@ -150,3 +147,6 @@ class GeometryHelpersMixin:
             - self.last_goal_time.nanoseconds
         ) / 1e9
         return elapsed_s >= self.minimum_goal_interval_s
+    
+def yaw_to_quaternion_z_w(yaw):
+    return math.sin(float(yaw) / 2.0), math.cos(float(yaw) / 2.0)

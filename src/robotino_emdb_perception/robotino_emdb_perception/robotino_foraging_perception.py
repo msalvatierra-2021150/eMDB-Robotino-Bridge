@@ -1,196 +1,218 @@
+#!/usr/bin/env python3
+"""Robotino perception adapter for the official GII e-MDB architecture.
+
+This class is created by the e-MDB Commander from the experiment YAML. It
+subscribes to RobotinoForagingState, converts the relevant state to normalized
+perceptions, and publishes the native e-MDB PerceptionStamped value topic.
+
+The physical tag ID and map coordinates intentionally remain outside the
+learned contextual vector. Robotino's resource memory and policy executor need
+those concrete values, but P-Nodes should learn general contexts such as
+"reliable reachable energy resource" rather than memorizing tag_2 or x=-1.7.
+"""
+
 import rclpy
 
 from cognitive_nodes.perception import Perception
 from core.utils import perception_dict_to_msg
 
-from robotino_emdb_interfaces.msg import RobotinoForagingState
-
 
 class RobotinoForagingPerception(Perception):
+    """Convert Robotino's foraging state into one normalized e-MDB sensor."""
+
     def __init__(
         self,
         name="foraging_state",
-        class_name="cognitive_nodes.perception.Perception",
+        class_name=(
+            "robotino_emdb_perception.robotino_foraging_perception."
+            "RobotinoForagingPerception"
+        ),
         default_msg=None,
         default_topic=None,
         normalize_data=None,
-        **params
+        **params,
     ):
         super().__init__(
             name=name,
             class_name=class_name,
             default_msg=default_msg,
             default_topic=default_topic,
-            normalize_data=normalize_data,
-            **params
+            normalize_data=normalize_data or {},
+            **params,
         )
+        self.node_type = "Perception"
+        self.activation.node_type = "Perception"
 
-    def clamp(self, value, min_value=0.0, max_value=1.0):
-        return max(min_value, min(max_value, float(value)))
+    @staticmethod
+    def clamp(value, min_value=0.0, max_value=1.0):
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = min_value
+        return max(min_value, min(max_value, numeric))
 
     def normalize(self, value, min_value, max_value, default=0.0):
-        if max_value == min_value:
-            return default
+        try:
+            minimum = float(min_value)
+            maximum = float(max_value)
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return self.clamp(default)
 
-        normalized = (float(value) - float(min_value)) / (
-            float(max_value) - float(min_value)
-        )
+        if maximum <= minimum:
+            return self.clamp(default)
 
-        return self.clamp(normalized)
+        return self.clamp((numeric - minimum) / (maximum - minimum))
+
+    @staticmethod
+    def field(message, name, default):
+        """Read a field while remaining compatible with the older ROS msg."""
+        return getattr(message, name, default)
 
     def process_and_send_reading(self):
-        n = self.normalize_values
+        """Publish the current Robotino state in native e-MDB format.
+
+        Rewards are deliberately not included. The official e-MDB MainLoop
+        obtains rewards from Goal/Drive nodes after policy execution and then
+        creates episodes and updates P-Nodes/C-Nodes itself.
+        """
+        n = self.normalize_values or {}
+
+        distance_min = n.get("distance_min", 0.0)
+        distance_max = n.get("distance_max", 3.0)
+        bearing_min = n.get("bearing_min", -3.141592653589793)
+        bearing_max = n.get("bearing_max", 3.141592653589793)
 
         p = {
-            # Observation
-            "valid": 1.0 if self.reading.valid else 0.0,
-            "visible": 1.0 if self.reading.visible else 0.0,
-
-            # One-hot tag identity
-            "tag_0": 0.0,
-            "tag_1": 0.0,
-            "tag_2": 0.0,
-            "tag_3": 0.0,
-            "tag_4": 0.0,
-            "tag_5": 0.0,
-
-            # Memory
+            # Current observation
+            "observation_valid": 1.0 if self.reading.valid else 0.0,
+            "tag_visible": 1.0 if self.reading.visible else 0.0,
             "first_time_seen": 1.0 if self.reading.first_time_seen else 0.0,
             "known_tag": 1.0 if self.reading.known_tag else 0.0,
-            "times_seen": self.normalize(
-                self.reading.times_seen,
-                0.0,
-                n["times_seen_max"],
-                default=0.0
-            ),
-
-            # Geometry
-            "confidence": self.clamp(self.reading.confidence),
-            "distance": self.normalize(
+            "detection_confidence": self.clamp(self.reading.confidence),
+            "tag_distance": self.normalize(
                 self.reading.distance,
-                n["distance_min"],
-                n["distance_max"],
-                default=0.0
+                distance_min,
+                distance_max,
+                default=0.0,
             ),
-            "bearing": self.normalize(
+            "tag_bearing": self.normalize(
                 self.reading.bearing,
-                n["bearing_min"],
-                n["bearing_max"],
-                default=0.5
-            ),
-            "tag_x_map": self.normalize(
-                self.reading.tag_x_map,
-                n["map_x_min"],
-                n["map_x_max"],
-                default=0.0
-            ),
-            "tag_y_map": self.normalize(
-                self.reading.tag_y_map,
-                n["map_y_min"],
-                n["map_y_max"],
-                default=0.0
-            ),
-            "robot_x_map": self.normalize(
-                self.reading.robot_x_map,
-                n["map_x_min"],
-                n["map_x_max"],
-                default=0.0
-            ),
-            "robot_y_map": self.normalize(
-                self.reading.robot_y_map,
-                n["map_y_min"],
-                n["map_y_max"],
-                default=0.0
+                bearing_min,
+                bearing_max,
+                default=0.5,
             ),
 
-            # Foraging/resource meaning
+            # Meaning of the visible resource
             "is_energy_bank": 1.0 if self.reading.is_energy_bank else 0.0,
-            "resource_available": 1.0 if self.reading.resource_available else 0.0,
-            "resource_remaining": self.clamp(self.reading.resource_remaining),
-            "resource_value": self.clamp(self.reading.resource_value),
+            "resource_available": (
+                1.0 if self.reading.resource_available else 0.0
+            ),
+            "resource_remaining": self.clamp(
+                self.reading.resource_remaining
+            ),
 
-            # Internal state
+            # Robot internal state
             "robot_energy": self.clamp(self.reading.robot_energy),
             "energy_need": self.clamp(self.reading.energy_need),
 
-            # Rewards
-            "novelty_reward": self.clamp(self.reading.novelty_reward),
-            "energy_reward": self.clamp(self.reading.energy_reward),
-            "goal_reward": self.clamp(self.reading.goal_reward),
-            "total_reward": self.normalize(
-                self.reading.total_reward,
-                0.0,
-                n["total_reward_max"],
-                default=0.0
+            # Best remembered candidate selected by Robotino resource memory
+            "best_energy_bank_known": (
+                1.0 if self.reading.best_energy_tag_id >= 0 else 0.0
+            ),
+            "best_energy_foraging_score": self.clamp(
+                self.field(
+                    self.reading,
+                    "best_energy_foraging_score",
+                    self.reading.best_energy_score,
+                )
+            ),
+            "best_energy_presence": self.clamp(
+                self.field(
+                    self.reading,
+                    "best_energy_presence_confidence",
+                    0.5,
+                )
+            ),
+            "best_energy_reachability": self.clamp(
+                self.field(
+                    self.reading,
+                    "best_energy_reachability_confidence",
+                    0.5,
+                )
+            ),
+            "best_energy_recharge_reliability": self.clamp(
+                self.field(
+                    self.reading,
+                    "best_energy_recharge_reliability",
+                    0.5,
+                )
+            ),
+            "best_energy_worthiness": self.clamp(
+                self.field(
+                    self.reading,
+                    "best_energy_worthiness",
+                    0.5,
+                )
+            ),
+            "best_energy_score": self.clamp(
+                self.reading.best_energy_score
             ),
 
-            # Remembered best bank
-            "best_energy_bank_known": 1.0
-            if self.reading.best_energy_tag_id >= 0
-            else 0.0,
-            "best_energy_x_map": self.normalize(
-                self.reading.best_energy_x_map,
-                n["map_x_min"],
-                n["map_x_max"],
-                default=0.0
+            # Mission context. Seeing the goal and satisfying it are different.
+            "goal_known": (
+                1.0
+                if self.field(self.reading, "goal_known", False)
+                else 0.0
             ),
-            "best_energy_y_map": self.normalize(
-                self.reading.best_energy_y_map,
-                n["map_y_min"],
-                n["map_y_max"],
-                default=0.0
-            ),
-            "best_energy_score": self.clamp(self.reading.best_energy_score),
-
-            # Goal
             "goal_satisfied": 1.0 if self.reading.goal_satisfied else 0.0,
         }
 
-        tag_id = int(self.reading.tag_id)
-
-        if 0 <= tag_id <= 5:
-            p[f"tag_{tag_id}"] = 1.0
-
-        sensor = {}
-        sensor[self.name] = [p]
-
+        sensor = {self.name: [p]}
         sensor_msg = perception_dict_to_msg(sensor)
 
         self.publish_msg.perception = sensor_msg
         self.publish_msg.timestamp = self.get_clock().now().to_msg()
-
         self.perception_publisher.publish(self.publish_msg)
+
+        self.get_logger().debug(
+            f"Published native e-MDB perception {self.name}: {p}"
+        )
 
 
 def main(args=None):
+    """Standalone test entry point.
+
+    In the real integration the e-MDB Commander should instantiate this class
+    from the experiment YAML instead of launching this executable manually.
+    """
     rclpy.init(args=args)
 
     node = RobotinoForagingPerception(
         name="foraging_state",
-        class_name="cognitive_nodes.perception.Perception",
-        default_msg=RobotinoForagingState,
+        class_name=(
+            "robotino_emdb_perception.robotino_foraging_perception."
+            "RobotinoForagingPerception"
+        ),
+        default_msg=(
+            "robotino_emdb_interfaces.msg.RobotinoForagingState"
+        ),
         default_topic="/robotino/emdb/foraging_state",
         normalize_data={
             "distance_min": 0.0,
             "distance_max": 3.0,
-            "bearing_min": -1.57,
-            "bearing_max": 1.57,
-            "map_x_min": -3.0,
-            "map_x_max": 3.0,
-            "map_y_min": -3.0,
-            "map_y_max": 3.0,
-            "times_seen_max": 10.0,
-            "total_reward_max": 3.0,
-        }
+            "bearing_min": -3.141592653589793,
+            "bearing_max": 3.141592653589793,
+        },
     )
 
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":

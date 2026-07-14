@@ -18,7 +18,7 @@ class AprilTagTFToEMDBBridge(Node):
         super().__init__("apriltag_tf_to_emdb_bridge")
 
         self.declare_parameter("detections_topic", "/detections")
-        self.declare_parameter("output_topic", "/robotino/emdb/tag_detection")
+        self.declare_parameter("output_topic", "/robotino/emdb/tag_observation")
 
         self.declare_parameter("map_frame", "map")
         self.declare_parameter("robot_frame", "base_link")

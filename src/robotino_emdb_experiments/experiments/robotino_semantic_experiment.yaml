@@ -1,58 +1,37 @@
 Experiment:
   name: main_loop
   class_name: cognitive_processes.main_loop.MainLoop
-  new_executor: True
+  new_executor: true
   threads: 2
   parameters:
-    iterations: 10000
+    iterations: 0
     trials: 20
-    subgoals: False
-    softmax_selection: True
+    subgoals: false
+    softmax_selection: false
     softmax_temperature: 0.3
-    kill_on_finish: False
+    kill_on_finish: false
 
 Control:
   id: robotino_control
-
   control_topic: /main_loop/control
   control_msg: cognitive_processes_interfaces.msg.ControlMsg
-
   episodes_topic: /main_loop/episodes
   episodes_msg: cognitive_node_interfaces.msg.Episode
-
   world_reset_service: /emdb/robotino/world_reset
   world_reset_msg: cognitive_processes_interfaces.srv.WorldReset
-  
+
 LTM:
   Files:
-    -
-      id: goodness
+    - id: goodness
       class: core.file.FileGoodness
       file: robotino_goodness.txt
-    -
-      id: pnodes_success
+    - id: pnodes_success
       class: core.file.FilePNodesSuccess
       file: robotino_pnodes_success.txt
 
   Nodes:
     Perception:
-      -
-        name: tag_detection
-        class_name: robotino_emdb_perception.robotino_tag_perception.RobotinoTagPerception
-        parameters:
-          default_msg: robotino_emdb_interfaces.msg.RobotinoTag
-          default_topic: /robotino/emdb/tag_detection
-          normalize_data:
-            distance_min: 0.0
-            distance_max: 3.0
-            bearing_min: -1.57
-            bearing_max: 1.57
-            map_x_min: -3.0
-            map_x_max: 3.0
-            map_y_min: -3.0
-            map_y_max: 3.0
-      -
-        name: foraging_state
+      - name: foraging_state
         class_name: robotino_emdb_perception.robotino_foraging_perception.RobotinoForagingPerception
         parameters:
           default_msg: robotino_emdb_interfaces.msg.RobotinoForagingState
@@ -60,55 +39,38 @@ LTM:
           normalize_data:
             distance_min: 0.0
             distance_max: 3.0
-
-            bearing_min: -1.57
-            bearing_max: 1.57
-
-            map_x_min: -3.0
-            map_x_max: 3.0
-
-            map_y_min: -3.0
-            map_y_max: 3.0
-
-            times_seen_max: 10.0
-            total_reward_max: 3.0
+            bearing_min: -3.141592653589793
+            bearing_max: 3.141592653589793
 
     RobotPurpose:
-      -
-        name: novelty_need
+      - name: novelty_need
         class_name: cognitive_nodes.robot_purpose.RobotPurpose
         parameters:
           weight: 1.0
           drive_id: novelty_drive
           purpose_type: Need
-          terminal: False
+          terminal: false
 
     Drive:
-      -
-        name: novelty_drive
+      - name: novelty_drive
         class_name: cognitive_nodes.novelty.DriveNovelty
         parameters:
-          neighbors: [{"name": "novelty_need", "node_type": "RobotPurpose"}]
+          neighbors:
+            - name: novelty_need
+              node_type: RobotPurpose
 
   Connectors:
-    -
-      data: Space
+    - data: Space
       default_class: cognitive_nodes.space.SVMSpace
-    -
-      data: Perception
+    - data: Perception
       default_class: cognitive_nodes.perception.Perception
-    -
-      data: PNode
+    - data: PNode
       default_class: cognitive_nodes.pnode.PNode
-    -
-      data: CNode
+    - data: CNode
       default_class: cognitive_nodes.cnode.CNode
-    -
-      data: Goal
+    - data: Goal
       default_class: cognitive_nodes.goal.Goal
-    -
-      data: WorldModel
+    - data: WorldModel
       default_class: cognitive_nodes.world_model.WorldModel
-    -
-      data: Policy
+    - data: Policy
       default_class: cognitive_nodes.policy.Policy
