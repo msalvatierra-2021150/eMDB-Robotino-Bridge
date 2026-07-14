@@ -1,22 +1,17 @@
 """Semantic interaction confirmation.
 
-After Nav2 reaches a tag's standoff pose, this module waits for a real
-state change (energy increase for the energy bank, reward/goal-flag
-change for the goal) before reporting semantic success. Reaching a pose
-alone is never treated as success.
+After Nav2 reaches a tag's standoff pose, this module waits for a real state
+change before reporting semantic success. Reaching a pose alone is not treated
+as success.
 """
+
+from robotino_emdb_interfaces.msg import RobotinoPolicyOutcome
+
+from . import constants
 
 
 class InteractionWaitingMixin:
-    """Requires from the host class:
-
-    Attributes: latest_foraging_state, interaction_timeout_s,
-        energy_success_delta, reward_success_delta.
-    Methods: get_execution(), get_waiting_context(), get_current_energy(),
-        get_current_reward(), publish_policy_outcome(), finish_execution().
-    Constants: STAGE_NAVIGATING, STAGE_WAITING_INTERACTION,
-        POLICY_RETURN_TO_BEST_ENERGY_BANK, POLICY_GOAL.
-    """
+    """Post-navigation energy/reward confirmation."""
 
     def enter_interaction_wait(self, generation: int) -> None:
         context = self.get_execution(generation, self.STAGE_NAVIGATING)
@@ -46,37 +41,47 @@ class InteractionWaitingMixin:
         candidate_name = context.get("selected_candidate_name") or "candidate"
 
         if policy_id == self.POLICY_RETURN_TO_BEST_ENERGY_BANK:
-            status = (
+            event_description = (
                 "energy_approach_pose_reached_waiting_for_charge_"
                 f"{candidate_name}"
             )
         elif policy_id == self.POLICY_GOAL:
-            status = (
+            event_description = (
                 "goal_approach_pose_reached_waiting_for_reward_"
                 f"{candidate_name}"
             )
         else:
-            # Only energy and goal policies should use tag navigation now.
+            # Only energy and goal policies should use tag navigation here.
             self.finish_execution(
                 generation,
                 success=True,
-                status=f"tag_approach_pose_reached_{candidate_name}",
+                failure_reason=constants.FAILURE_NONE,
                 resume_exploration=False,
+                navigation_result=RobotinoPolicyOutcome.NAV_SUCCEEDED,
+                tag_result=RobotinoPolicyOutcome.TAG_NOT_CHECKED,
             )
             return
 
-        self.get_logger().info(status)
+        self.get_logger().info(event_description)
 
-        # This is intentionally unfinished and unsuccessful. Reaching a Nav2
-        # standoff pose is not the same as charging or completing the goal.
+        # In-progress notification. Nav2 succeeded, but the semantic policy is
+        # not complete until charging/reward is confirmed.
         self.publish_policy_outcome(
-            policy,
-            started=True,
-            finished=False,
-            success=False,
-            status=status,
+            policy=policy,
+            policy_completed=False,
+            policy_success=False,
+            failure_reason=constants.FAILURE_NONE,
             energy_before=float(context["energy_before"]),
-            reward_before=float(context["reward_before"]),
+            target_type=self.target_type_for_policy(policy),
+            target_id=int(policy.target_tag_id),
+            navigation_result=RobotinoPolicyOutcome.NAV_SUCCEEDED,
+            tag_result=RobotinoPolicyOutcome.TAG_NOT_CHECKED,
+            detection_confidence=None,
+            observed_tag_pose=None,
+            recharge_attempted=(
+                policy_id == self.POLICY_RETURN_TO_BEST_ENERGY_BANK
+            ),
+            recharge_succeeded=False,
         )
 
         self.check_interaction_completion()
@@ -95,8 +100,7 @@ class InteractionWaitingMixin:
 
         if policy_id == self.POLICY_RETURN_TO_BEST_ENERGY_BANK:
             if context["arrival_energy"] is None:
-                # Establish a valid baseline on the first state sample instead
-                # of comparing a real energy value against the fallback 0.0.
+                # Establish a real baseline on the first state sample.
                 context["arrival_energy"] = self.get_current_energy()
                 return
 
@@ -112,14 +116,16 @@ class InteractionWaitingMixin:
                 self.finish_execution(
                     generation,
                     success=True,
-                    status="energy_charge_confirmed",
+                    failure_reason=constants.FAILURE_NONE,
                     resume_exploration=self.resume_exploration_after_energy,
+                    navigation_result=RobotinoPolicyOutcome.NAV_SUCCEEDED,
+                    tag_result=RobotinoPolicyOutcome.TAG_FOUND,
+                    recharge_attempted=True,
+                    recharge_succeeded=True,
                 )
 
         elif policy_id == self.POLICY_GOAL:
             if context["arrival_reward"] is None:
-                # Establish both baselines on the first state sample. This
-                # prevents a late first state message from looking like reward.
                 context["arrival_reward"] = self.get_current_reward()
                 context["arrival_goal_complete"] = (
                     self.foraging_state_reports_goal_complete()
@@ -134,10 +140,7 @@ class InteractionWaitingMixin:
                 and self.foraging_state_reports_goal_complete()
             )
 
-            if (
-                reward_delta >= self.reward_success_delta
-                or goal_flag_transition
-            ):
+            if reward_delta >= self.reward_success_delta or goal_flag_transition:
                 self.get_logger().info(
                     "Goal interaction confirmed: "
                     f"reward increased by {reward_delta:.3f}."
@@ -145,8 +148,10 @@ class InteractionWaitingMixin:
                 self.finish_execution(
                     generation,
                     success=True,
-                    status="goal_interaction_confirmed",
+                    failure_reason=constants.FAILURE_NONE,
                     resume_exploration=False,
+                    navigation_result=RobotinoPolicyOutcome.NAV_SUCCEEDED,
+                    tag_result=RobotinoPolicyOutcome.TAG_FOUND,
                 )
 
     def interaction_timer_callback(self) -> None:
@@ -172,33 +177,38 @@ class InteractionWaitingMixin:
         generation = int(context["generation"])
 
         if policy_id == self.POLICY_RETURN_TO_BEST_ENERGY_BANK:
-            status = "energy_interaction_timeout_no_charge_detected"
+            failure_reason = constants.FAILURE_RECHARGE_TIMEOUT
+            event_description = "energy_interaction_timeout_no_charge_detected"
         elif policy_id == self.POLICY_GOAL:
-            status = "goal_interaction_timeout_no_reward_detected"
+            failure_reason = constants.FAILURE_GOAL_NOT_CONFIRMED
+            event_description = "goal_interaction_timeout_no_reward_detected"
         else:
-            status = "interaction_timeout"
+            failure_reason = constants.FAILURE_OBSERVATION_TIMEOUT
+            event_description = "interaction_timeout"
 
-        self.get_logger().warn(status)
+        self.get_logger().warn(event_description)
         self.finish_execution(
             generation,
             success=False,
-            status=status,
+            failure_reason=failure_reason,
             resume_exploration=self.resume_exploration_after_failure,
+            navigation_result=RobotinoPolicyOutcome.NAV_SUCCEEDED,
+            tag_result=RobotinoPolicyOutcome.TAG_CHECK_INCONCLUSIVE,
+            recharge_attempted=(
+                policy_id == self.POLICY_RETURN_TO_BEST_ENERGY_BANK
+            ),
+            recharge_succeeded=False,
         )
 
     def foraging_state_reports_goal_complete(self) -> bool:
-        """Use an explicit completion flag when the message provides one.
-
-        The currently used message is known to contain total_reward. This
-        introspection also supports future interface versions without making
-        this node depend on a field that may not yet exist.
-        """
+        """Use an explicit completion flag when the message provides one."""
         if self.latest_foraging_state is None:
             return False
 
         for field_name in (
             "goal_reached",
             "goal_achieved",
+            "goal_satisfied",
             "task_complete",
             "task_completed",
         ):

@@ -12,7 +12,9 @@ from typing import Any, Dict, List
 from action_msgs.msg import GoalStatus
 from nav2_msgs.action import ComputePathToPose
 
-from robotino_emdb_interfaces.msg import RobotinoSelectedPolicy
+from robotino_emdb_interfaces.msg import RobotinoPolicyOutcome, RobotinoSelectedPolicy
+
+from . import constants
 
 MIN_DISTANCE_EPSILON_M = 0.001
 
@@ -43,9 +45,8 @@ class NavigationPlanningMixin:
         if not bool(policy.use_nav2):
             self.publish_simple_outcome(
                 policy,
-                started=False,
                 success=False,
-                status="policy_does_not_use_nav2",
+                failure_reason=constants.FAILURE_POLICY_DOES_NOT_USE_NAV2,
             )
             self.resume_after_failed_execution_if_configured()
             return
@@ -57,9 +58,8 @@ class NavigationPlanningMixin:
             )
             self.publish_simple_outcome(
                 policy,
-                started=False,
                 success=False,
-                status="dry_run_nav2_disabled",
+                failure_reason=constants.FAILURE_EXECUTION_DISABLED,
             )
             self.resume_after_failed_execution_if_configured()
             return
@@ -80,9 +80,8 @@ class NavigationPlanningMixin:
         if robot_position is None:
             self.publish_simple_outcome(
                 policy,
-                started=False,
                 success=False,
-                status="no_current_robot_tf_pose",
+                failure_reason=constants.FAILURE_NO_ROBOT_POSE,
             )
             self.resume_after_failed_execution_if_configured()
             return
@@ -108,9 +107,8 @@ class NavigationPlanningMixin:
             )
             self.publish_simple_outcome(
                 policy,
-                started=False,
                 success=False,
-                status="invalid_approach_geometry",
+                failure_reason=constants.FAILURE_TARGET_POSE_INVALID,
             )
             self.resume_after_failed_execution_if_configured()
             return
@@ -131,9 +129,8 @@ class NavigationPlanningMixin:
             )
             self.publish_simple_outcome(
                 policy,
-                started=False,
                 success=False,
-                status="invalid_tag_approach_axis",
+                failure_reason=constants.FAILURE_TARGET_POSE_INVALID,
             )
             self.resume_after_failed_execution_if_configured()
             return
@@ -201,8 +198,9 @@ class NavigationPlanningMixin:
             self.finish_execution(
                 generation,
                 success=False,
-                status="compute_path_server_unavailable",
+                failure_reason=constants.FAILURE_PATH_UNAVAILABLE,
                 resume_exploration=self.resume_exploration_after_failure,
+                navigation_result=RobotinoPolicyOutcome.NAV_FAILED,
             )
             return
 
@@ -376,8 +374,9 @@ class NavigationPlanningMixin:
             self.finish_execution(
                 generation,
                 success=False,
-                status="observation_side_not_reachable",
+                failure_reason=constants.FAILURE_TARGET_UNREACHABLE,
                 resume_exploration=self.resume_exploration_after_failure,
+                navigation_result=RobotinoPolicyOutcome.NAV_FAILED,
             )
             return
 

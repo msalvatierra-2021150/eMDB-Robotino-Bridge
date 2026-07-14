@@ -1,24 +1,16 @@
-"""Navigation execution: send the selected approach pose to NavigateToPose
-and handle its result.
-
-Stale Nav2 results (from a cancelled or superseded execution generation)
-are dropped here so they can never be attributed to a newer policy.
-"""
+"""Send selected approach poses to NavigateToPose and handle results."""
 
 from typing import Any, Dict
 
 from action_msgs.msg import GoalStatus
 from nav2_msgs.action import NavigateToPose
+from robotino_emdb_interfaces.msg import RobotinoPolicyOutcome
+
+from . import constants
 
 
 class NavigationExecutionMixin:
-    """Requires from the host class:
-
-    Attributes: nav2_client, active_navigation_goal_handle, last_goal_time.
-    Methods: get_execution(), finish_execution(), enter_interaction_wait(),
-        stop_robot().
-    Constants: STAGE_PLANNING, STAGE_NAVIGATING.
-    """
+    """NavigateToPose execution with stale-callback protection."""
 
     def send_navigation_goal(
         self,
@@ -36,8 +28,9 @@ class NavigationExecutionMixin:
             self.finish_execution(
                 generation,
                 success=False,
-                status="nav2_server_unavailable",
+                failure_reason=constants.FAILURE_NAVIGATION_FAILED,
                 resume_exploration=self.resume_exploration_after_failure,
+                navigation_result=RobotinoPolicyOutcome.NAV_FAILED,
             )
             return
 
@@ -66,8 +59,9 @@ class NavigationExecutionMixin:
             self.finish_execution(
                 generation,
                 success=False,
-                status="nav2_goal_send_failed",
+                failure_reason=constants.FAILURE_NAVIGATION_FAILED,
                 resume_exploration=self.resume_exploration_after_failure,
+                navigation_result=RobotinoPolicyOutcome.NAV_FAILED,
             )
             return
 
@@ -76,8 +70,9 @@ class NavigationExecutionMixin:
             self.finish_execution(
                 generation,
                 success=False,
-                status="nav2_goal_rejected",
+                failure_reason=constants.FAILURE_GOAL_REJECTED,
                 resume_exploration=self.resume_exploration_after_failure,
+                navigation_result=RobotinoPolicyOutcome.NAV_FAILED,
             )
             return
 
@@ -93,8 +88,6 @@ class NavigationExecutionMixin:
     def nav2_result_callback(self, future, generation: int) -> None:
         context = self.get_execution(generation, self.STAGE_NAVIGATING)
         if context is None:
-            # This is the critical stale-callback protection. A result from a
-            # cancelled/older policy is never applied to the current policy.
             self.get_logger().debug(
                 f"Ignoring stale Nav2 result for generation {generation}."
             )
@@ -111,14 +104,25 @@ class NavigationExecutionMixin:
             )
             status = -1
 
-        if status != GoalStatus.STATUS_SUCCEEDED:
-            self.finish_execution(
-                generation,
-                success=False,
-                status=f"nav2_goal_finished_status_{status}",
-                resume_exploration=self.resume_exploration_after_failure,
-            )
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.stop_robot()
+            self.enter_interaction_wait(generation)
             return
 
-        self.stop_robot()
-        self.enter_interaction_wait(generation)
+        if status == GoalStatus.STATUS_CANCELED:
+            navigation_result = RobotinoPolicyOutcome.NAV_CANCELED
+            failure_reason = constants.FAILURE_NAVIGATION_CANCELED
+        elif status == GoalStatus.STATUS_ABORTED:
+            navigation_result = RobotinoPolicyOutcome.NAV_FAILED
+            failure_reason = constants.FAILURE_NAVIGATION_ABORTED
+        else:
+            navigation_result = RobotinoPolicyOutcome.NAV_FAILED
+            failure_reason = constants.FAILURE_NAVIGATION_FAILED
+
+        self.finish_execution(
+            generation,
+            success=False,
+            failure_reason=failure_reason,
+            resume_exploration=self.resume_exploration_after_failure,
+            navigation_result=navigation_result,
+        )

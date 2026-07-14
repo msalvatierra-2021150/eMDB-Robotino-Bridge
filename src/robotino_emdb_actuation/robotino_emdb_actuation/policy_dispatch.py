@@ -1,30 +1,16 @@
-"""Inputs and high-level policy dispatch.
-
-Receives the eMDB-selected policy and foraging state, and routes each
-selected policy to the correct execution path.
-"""
+"""Inputs and high-level policy dispatch."""
 
 from robotino_emdb_interfaces.msg import (
+    RobotinoPolicyOutcome,
     RobotinoForagingState,
     RobotinoSelectedPolicy,
 )
 
+from . import constants
+
 
 class PolicyDispatchMixin:
-    """Requires from the host class:
-
-    Attributes: latest_foraging_state, execution.
-    Methods: is_waiting_for_interaction(), check_interaction_completion(),
-        execute_continue_exploring(), execute_inspect_visible_tag(),
-        execute_return_to_best_energy_bank(), execute_search_for_energy(),
-        execute_goal(), cancel_current_execution(), start_tag_navigation(),
-        publish_simple_outcome(), set_exploration_enabled(),
-        is_same_policy_already_active(), active_policy_id(),
-        describe_active_execution().
-    Constants: POLICY_CONTINUE_EXPLORING, POLICY_INSPECT_VISIBLE_TAG,
-        POLICY_RETURN_TO_BEST_ENERGY_BANK, POLICY_SEARCH_FOR_ENERGY,
-        POLICY_GOAL.
-    """
+    """Receive eMDB-selected policies and route them to execution paths."""
 
     def foraging_callback(self, msg: RobotinoForagingState) -> None:
         self.latest_foraging_state = msg
@@ -50,8 +36,13 @@ class PolicyDispatchMixin:
             self.execute_goal(msg)
         else:
             self.get_logger().warn(
-                f"Ignoring unknown policy_id={policy_id}, "
+                f"Unsupported policy_id={policy_id}, "
                 f"policy_name='{msg.policy_name}'."
+            )
+            self.publish_simple_outcome(
+                msg,
+                success=False,
+                failure_reason=constants.FAILURE_POLICY_NOT_SUPPORTED,
             )
 
     def execute_continue_exploring(
@@ -65,9 +56,8 @@ class PolicyDispatchMixin:
         self.set_exploration_enabled(True)
         self.publish_simple_outcome(
             policy,
-            started=True,
             success=True,
-            status="continuing_exploration",
+            failure_reason=constants.FAILURE_NONE,
         )
 
     def execute_search_for_energy(
@@ -81,31 +71,29 @@ class PolicyDispatchMixin:
         self.set_exploration_enabled(True)
         self.publish_simple_outcome(
             policy,
-            started=True,
             success=True,
-            status="searching_for_energy",
+            failure_reason=constants.FAILURE_NONE,
         )
 
     def execute_inspect_visible_tag(
         self,
         policy: RobotinoSelectedPolicy,
     ) -> None:
-        """Acknowledge perception/memory without changing robot motion.
-
-        The perception/memory layer is responsible for saving the tag. This
-        executor intentionally does not cancel exploration, cancel an energy
-        return, disable exploration, or issue a Nav2 goal here.
-        """
+        """Acknowledge a visible tag without changing robot motion."""
         active_description = self.describe_active_execution()
+        confidence = self.detection_confidence_for_policy(policy)
+
         self.get_logger().info(
             f"Observed tag {int(policy.target_tag_id)} saved by memory layer; "
             f"motion unchanged ({active_description})."
         )
         self.publish_simple_outcome(
             policy,
-            started=True,
             success=True,
-            status="tag_observed_and_saved_no_motion",
+            failure_reason=constants.FAILURE_NONE,
+            navigation_result=RobotinoPolicyOutcome.NAV_NOT_USED,
+            tag_result=RobotinoPolicyOutcome.TAG_FOUND,
+            detection_confidence=confidence,
         )
 
     def execute_return_to_best_energy_bank(
@@ -114,12 +102,11 @@ class PolicyDispatchMixin:
     ) -> None:
         if self.is_same_policy_already_active(policy):
             self.get_logger().debug(
-                "Repeated energy-return policy ignored; execution is already active."
+                "Repeated energy-return policy ignored; execution is active."
             )
             return
 
-        # Energy has priority over goal. If a goal approach is running, close
-        # it as preempted and begin the energy return immediately.
+        # Energy has priority over goal.
         if self.execution is not None:
             self.cancel_current_execution(
                 reason="preempted_by_higher_priority_energy_policy",
@@ -138,12 +125,11 @@ class PolicyDispatchMixin:
             )
             return
 
-        # Defensive priority guard. A goal policy may not interrupt returning
-        # to an energy bank or waiting for charging confirmation.
+        # A goal may not interrupt returning to an energy bank.
         if self.active_policy_id() == self.POLICY_RETURN_TO_BEST_ENERGY_BANK:
             self.get_logger().warn(
-                "Goal policy deferred because an energy-return policy is active. "
-                "The goal remains stored for later."
+                "Goal policy deferred because an energy-return policy is "
+                "active. The goal remains stored for later."
             )
             return
 

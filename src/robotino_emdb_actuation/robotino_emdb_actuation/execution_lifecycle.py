@@ -1,42 +1,45 @@
 """Execution lifecycle and stale-callback safety.
 
 Every in-flight execution is tagged with a generation token. Incrementing
-the token invalidates any callback still in flight from an old or
-cancelled execution, so a late Nav2/ComputePathToPose result can never be
-attributed to the wrong policy.
+the token invalidates callbacks still in flight from an old or cancelled
+execution, so late Nav2/ComputePathToPose results cannot be attributed to a
+newer policy.
 """
 
 import math
 from typing import Any, Dict, Optional
 
-from robotino_emdb_interfaces.msg import RobotinoSelectedPolicy
+from geometry_msgs.msg import PoseStamped
+from robotino_emdb_interfaces.msg import RobotinoPolicyOutcome, RobotinoSelectedPolicy
+
+from . import constants
 
 
 class ExecutionLifecycleMixin:
-    """Requires from the host class:
-
-    Attributes: execution, execution_generation, active_path_goal_handle,
-        active_navigation_goal_handle, candidate_plan_candidates,
-        candidate_plan_index.
-    Methods: publish_policy_outcome(), set_exploration_enabled(),
-        stop_robot().
-    Constants: STAGE_WAITING_INTERACTION.
-    """
+    """Shared completion, cancellation, and active-execution helpers."""
 
     def finish_execution(
         self,
         generation: int,
         success: bool,
-        status: str,
+        failure_reason: str,
         resume_exploration: bool,
+        navigation_result: int = RobotinoPolicyOutcome.NAV_NOT_USED,
+        tag_result: int = RobotinoPolicyOutcome.TAG_NOT_CHECKED,
+        detection_confidence: Optional[float] = None,
+        observed_tag_pose: Optional[PoseStamped] = None,
+        recharge_attempted: bool = False,
+        recharge_succeeded: bool = False,
     ) -> None:
+        """Close the current execution and publish its final outcome."""
         context = self.get_execution(generation)
         if context is None:
             return
 
         policy = context["policy"]
         energy_before = float(context["energy_before"])
-        reward_before = float(context["reward_before"])
+        target_type = self.target_type_for_policy(policy)
+        target_id = int(policy.target_tag_id)
 
         # Invalidate callbacks before publishing or enabling another behavior.
         self.execution_generation += 1
@@ -47,13 +50,19 @@ class ExecutionLifecycleMixin:
         self.candidate_plan_index = 0
 
         self.publish_policy_outcome(
-            policy,
-            started=True,
-            finished=True,
-            success=success,
-            status=status,
+            policy=policy,
+            policy_completed=True,
+            policy_success=success,
+            failure_reason=failure_reason,
             energy_before=energy_before,
-            reward_before=reward_before,
+            target_type=target_type,
+            target_id=target_id,
+            navigation_result=navigation_result,
+            tag_result=tag_result,
+            detection_confidence=detection_confidence,
+            observed_tag_pose=observed_tag_pose,
+            recharge_attempted=recharge_attempted,
+            recharge_succeeded=recharge_succeeded,
         )
 
         if resume_exploration:
@@ -106,13 +115,19 @@ class ExecutionLifecycleMixin:
 
         if publish_outcome:
             self.publish_policy_outcome(
-                old_policy,
-                started=True,
-                finished=True,
-                success=False,
-                status=reason,
+                policy=old_policy,
+                policy_completed=True,
+                policy_success=False,
+                failure_reason=constants.FAILURE_POLICY_PREEMPTED,
                 energy_before=float(old_context["energy_before"]),
-                reward_before=float(old_context["reward_before"]),
+                target_type=self.target_type_for_policy(old_policy),
+                target_id=int(old_policy.target_tag_id),
+                navigation_result=RobotinoPolicyOutcome.NAV_CANCELED,
+                tag_result=RobotinoPolicyOutcome.TAG_NOT_CHECKED,
+                detection_confidence=None,
+                observed_tag_pose=None,
+                recharge_attempted=False,
+                recharge_succeeded=False,
             )
 
     def get_execution(
