@@ -26,6 +26,8 @@ setup(
             "robotino_emdb_decision.robotino_policy_selector:main",
             "policy_execution_bridge = "
             "robotino_emdb_decision.robotino_policy_execution_bridge:main",
+            "demo_autonomy = "
+            "robotino_emdb_decision.robotino_demo_autonomy:main",
         ],
     },
 )

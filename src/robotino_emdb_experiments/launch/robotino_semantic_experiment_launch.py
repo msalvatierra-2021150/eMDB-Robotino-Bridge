@@ -32,6 +32,17 @@ def launch_setup(context: LaunchContext, *args, **kwargs):
     mapping_complete_topic = LaunchConfiguration('mapping_complete_topic')
     mapping_progress_topic = LaunchConfiguration('mapping_progress_topic') 
 
+    enable_demo_autonomy = LaunchConfiguration("enable_demo_autonomy")
+    demo_low_energy_threshold = LaunchConfiguration(
+        "demo_low_energy_threshold"
+    )
+    demo_resume_energy_threshold = LaunchConfiguration(
+        "demo_resume_energy_threshold"
+    )
+    demo_minimum_bank_worthiness = LaunchConfiguration(
+        "demo_minimum_bank_worthiness"
+    )
+
     enable_nav2_execution = LaunchConfiguration("enable_nav2_execution")
     nav2_action_name = LaunchConfiguration("nav2_action_name")
     publish_exploration_control = LaunchConfiguration(
@@ -208,6 +219,40 @@ def launch_setup(context: LaunchContext, *args, **kwargs):
         ],
     )
 
+    # Minimal deterministic bootstrap controller for the demo. It calls the
+    # same blocking service used by official GII PolicyBlocking nodes while
+    # the learned P-Node/C-Node activation layer is still being built.
+    demo_autonomy_node = Node(
+        package="robotino_emdb_decision",
+        executable="demo_autonomy",
+        name="robotino_demo_autonomy",
+        output="screen",
+        emulate_tty=True,
+        parameters=[
+            {
+                "enabled": ParameterValue(
+                    enable_demo_autonomy,
+                    value_type=bool,
+                ),
+                "foraging_topic": "/robotino/emdb/foraging_state",
+                "mapping_complete_topic": mapping_complete_topic,
+                "policy_service": "/robotino/emdb/execute_policy",
+                "low_energy_threshold": ParameterValue(
+                    demo_low_energy_threshold,
+                    value_type=float,
+                ),
+                "resume_energy_threshold": ParameterValue(
+                    demo_resume_energy_threshold,
+                    value_type=float,
+                ),
+                "minimum_bank_worthiness": ParameterValue(
+                    demo_minimum_bank_worthiness,
+                    value_type=float,
+                ),
+            }
+        ],
+    )
+
     shutdown_on_commander_exit = RegisterEventHandler(
         OnProcessExit(
             target_action=commander_node,
@@ -221,12 +266,14 @@ def launch_setup(context: LaunchContext, *args, **kwargs):
         shutdown_on_commander_exit,
         TimerAction(period=1.0, actions=[apriltag_tf_bridge_node]),
         TimerAction(period=2.0, actions=[foraging_memory_node]),
-        TimerAction(period=2.0, actions=[load_commander_config]),
         TimerAction(period=3.0,actions=[cognitive_signals_node]), 
+        TimerAction(period=2.0, actions=[load_commander_config]),
         TimerAction(period=3.0, actions=[policy_execution_bridge_node]),
-        TimerAction(period=6.0, actions=[policy_executor_node]),
         TimerAction(period=5.0, actions=[load_experiment_config]),
+        TimerAction(period=6.0, actions=[policy_executor_node]),
+        TimerAction(period=7.0, actions=[demo_autonomy_node]),
     ]
+
 
 def generate_launch_description():
     default_semantics_file = PathJoinSubstitution(
@@ -268,6 +315,42 @@ def generate_launch_description():
                 "semantics_file",
                 default_value=default_semantics_file,
                 description="YAML file defining semantic tag meanings.",
+            ),
+            DeclareLaunchArgument(
+                "mapping_complete_topic",
+                default_value="/frontier_exploration/mapping_complete",
+                description="Bool topic indicating frontier exploration is complete.",
+            ),
+            DeclareLaunchArgument(
+                "mapping_progress_topic",
+                default_value="",
+                description="Optional Float32 topic with exploration progress in [0, 1].",
+            ),
+            DeclareLaunchArgument(
+                "enable_demo_autonomy",
+                default_value="true",
+                description=(
+                    "Enable the deterministic worthiness-foraging demo "
+                    "coordinator."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "demo_low_energy_threshold",
+                default_value="0.35",
+                description="Energy level that starts resource recovery.",
+            ),
+            DeclareLaunchArgument(
+                "demo_resume_energy_threshold",
+                default_value="0.70",
+                description="Energy level that resumes normal exploration.",
+            ),
+            DeclareLaunchArgument(
+                "demo_minimum_bank_worthiness",
+                default_value="0.10",
+                description=(
+                    "Minimum remembered-bank worthiness accepted by the "
+                    "demo coordinator."
+                ),
             ),
             DeclareLaunchArgument(
                 "enable_nav2_execution",
@@ -317,22 +400,6 @@ def generate_launch_description():
                 default_value="robotino_semantic_experiment.yaml",
                 description="Robotino e-MDB experiment YAML.",
             ),
-            DeclareLaunchArgument(
-                "mapping_complete_topic",
-                default_value="/frontier_exploration/mapping_complete",
-                description=(
-                    "std_msgs/Bool topic published when frontier mapping is complete."
-                ),
-            ),
-
-            DeclareLaunchArgument(
-                "mapping_progress_topic",
-                default_value="",
-                description=(
-                    "Optional std_msgs/Float32 mapping progress topic in [0, 1]. "
-                    "Leave empty when only mapping_complete is available."
-                ),
-            ),
-                        OpaqueFunction(function=launch_setup),
+            OpaqueFunction(function=launch_setup),
         ]
     )

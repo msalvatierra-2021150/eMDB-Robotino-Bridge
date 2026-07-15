@@ -147,6 +147,7 @@ LTM:
             - name: mission_drive
               node_type: Drive
 
+
     Policy:
       - name: continue_exploring
         class_name: cognitive_nodes.policy.PolicyBlocking

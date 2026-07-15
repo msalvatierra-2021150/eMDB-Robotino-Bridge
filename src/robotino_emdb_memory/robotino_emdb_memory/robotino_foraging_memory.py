@@ -24,7 +24,6 @@ from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32
 import yaml
 
 from robotino_emdb_interfaces.msg import (
@@ -70,10 +69,6 @@ class RobotinoForagingMemory(Node):
         self.declare_parameter(
             "output_topic", "/robotino/emdb/foraging_state"
         )
-        self.declare_parameter(
-            "energy_drive_input_topic",
-            "/robotino/emdb/drive_input/energy",
-        )
 
         self.declare_parameter("initial_energy", 1.0)
         self.declare_parameter("energy_decay_per_second", 0.01)
@@ -98,9 +93,6 @@ class RobotinoForagingMemory(Node):
         self.input_topic = str(self.get_parameter("input_topic").value)
         self.outcome_topic = str(self.get_parameter("outcome_topic").value)
         self.output_topic = str(self.get_parameter("output_topic").value)
-        self.energy_drive_input_topic = str(
-            self.get_parameter("energy_drive_input_topic").value
-        )
 
         self.robot_energy = float(self.get_parameter("initial_energy").value)
         self.energy_decay_per_second = float(
@@ -156,12 +148,28 @@ class RobotinoForagingMemory(Node):
             self.get_parameter("semantics_file").value
         )
         self.tag_semantics = self.load_tag_semantics(self.semantics_file)
+        self.warned_unknown_tag_ids = set()
+
+        energy_tag_ids = sorted(
+            tag_id
+            for tag_id, semantics in self.tag_semantics.items()
+            if bool(semantics.get("is_energy_bank", False))
+        )
+        self.get_logger().info(
+            f"Configured energy-bank tag IDs: {energy_tag_ids}"
+        )
+        if not energy_tag_ids:
+            self.get_logger().error(
+                "No energy-bank tags are configured. "
+                "Check foraging_semantics.yaml."
+            )
 
         # Key: integer tag ID. Value: factual resource record.
         self.memory = {}
         self.load_resource_memory()
 
         self.goal_satisfied = False
+        self.last_logged_best_energy_tag_id = None
         self.latest_state = self.create_empty_state()
 
         # ------------------------------------------------------------------
@@ -184,11 +192,6 @@ class RobotinoForagingMemory(Node):
             self.output_topic,
             10,
         )
-        self.energy_drive_input_publisher = self.create_publisher(
-            Float32,
-            self.energy_drive_input_topic,
-            10,
-        )
 
         self.energy_timer = self.create_timer(1.0, self.energy_decay_step)
         self.state_timer = self.create_timer(
@@ -204,9 +207,6 @@ class RobotinoForagingMemory(Node):
         self.get_logger().info(f"Tag observations: {self.input_topic}")
         self.get_logger().info(f"Policy outcomes: {self.outcome_topic}")
         self.get_logger().info(f"Foraging state: {self.output_topic}")
-        self.get_logger().info(
-            f"Energy drive input: {self.energy_drive_input_topic}"
-        )
         self.get_logger().info(f"Persistent memory: {self.memory_file}")
 
     # ==================================================================
@@ -238,30 +238,6 @@ class RobotinoForagingMemory(Node):
             0.0,
             1.0,
         )
-
-    def energy_drive_input(self):
-        """Encode the existing energy_need for GII's DriveExponential.
-
-        DriveExponential computes evaluation = exp(-5 * input), with an
-        exact zero when input is 1.0. By publishing -log(energy_need) / 5,
-        its evaluation reproduces the current Robotino energy_need value:
-
-            energy_need = 1.0  -> input = 0.0 -> drive = 1.0
-            energy_need = 0.5  -> input ~= 0.139 -> drive = 0.5
-            energy_need = 0.0  -> input = 1.0 -> drive = 0.0
-
-        Therefore this integration does not alter the existing low-energy
-        threshold logic; it only moves the drive representation into e-MDB.
-        """
-        need = self.energy_need()
-        if need <= 0.0:
-            return 1.0
-        return self.clamp(-math.log(need) / 5.0, 0.0, 1.0)
-
-    def publish_energy_drive_input(self):
-        message = Float32()
-        message.data = float(self.energy_drive_input())
-        self.energy_drive_input_publisher.publish(message)
 
     # ==================================================================
     # Semantic configuration and persistence
@@ -376,6 +352,55 @@ class RobotinoForagingMemory(Node):
         ]
         return data
 
+    def apply_current_semantics(self, tag_id, data):
+        """Migrate a remembered record to the currently loaded semantics.
+
+        Earlier runs may have stored a tag as ``unknown`` or as a non-energy
+        tag when the semantics path or tag IDs were wrong.  Without this
+        migration, correcting the YAML would never make that persistent record
+        eligible for best-bank selection.
+        """
+        semantics = self.tag_semantics.get(int(tag_id))
+        if semantics is None:
+            if int(tag_id) not in self.warned_unknown_tag_ids:
+                self.warned_unknown_tag_ids.add(int(tag_id))
+                self.get_logger().warn(
+                    f"Tag {int(tag_id)} is not present in "
+                    f"{self.semantics_file}; it cannot be an energy bank."
+                )
+            return self.ensure_memory_schema(data)
+
+        previous_type = str(data.get("tag_type", "unknown"))
+        previous_is_bank = bool(data.get("is_energy_bank", False))
+
+        data["tag_type"] = str(semantics["type"])
+        data["is_energy_bank"] = bool(semantics["is_energy_bank"])
+        data["resource_capacity"] = float(semantics["capacity"])
+        data["collection_rate"] = float(semantics["collection_rate"])
+        data["regen_rate"] = float(semantics["regen_rate"])
+        data.setdefault("resource_remaining", float(semantics["capacity"]))
+
+        # Clamp old persisted values to the current configured capacity.
+        capacity = max(0.0, float(data["resource_capacity"]))
+        data["resource_remaining"] = self.clamp(
+            data.get("resource_remaining", capacity),
+            0.0,
+            capacity,
+        )
+
+        if (
+            previous_type != data["tag_type"]
+            or previous_is_bank != data["is_energy_bank"]
+        ):
+            self.get_logger().warn(
+                f"Migrated tag {int(tag_id)} semantics: "
+                f"type {previous_type!r} -> {data['tag_type']!r}, "
+                f"is_energy_bank {previous_is_bank} -> "
+                f"{data['is_energy_bank']}"
+            )
+
+        return self.ensure_memory_schema(data)
+
     def load_resource_memory(self):
         if not self.persist_memory or not self.memory_file.exists():
             return
@@ -387,7 +412,9 @@ class RobotinoForagingMemory(Node):
             raw_tags = payload.get("tags", {})
             for raw_id, data in raw_tags.items():
                 tag_id = int(raw_id)
-                record = self.ensure_memory_schema(dict(data))
+                record = self.apply_current_semantics(
+                    tag_id, dict(data)
+                )
 
                 # ROS simulation time may restart between runs. Keep the facts
                 # and evidence, but restart transient time references.
@@ -460,7 +487,6 @@ class RobotinoForagingMemory(Node):
         self.set_if_available(state, "goal_known", self.goal_known())
         self.fill_best_energy_bank(state)
         self.publisher.publish(state)
-        self.publish_energy_drive_input()
 
     def energy_decay_step(self):
         self.robot_energy = self.clamp(
@@ -510,14 +536,27 @@ class RobotinoForagingMemory(Node):
             },
         )
 
+        if tag_id not in self.tag_semantics:
+            if tag_id not in self.warned_unknown_tag_ids:
+                self.warned_unknown_tag_ids.add(tag_id)
+                self.get_logger().warn(
+                    f"Observed tag {tag_id}, but it has no entry in "
+                    f"{self.semantics_file}. Current configured IDs: "
+                    f"{sorted(self.tag_semantics)}"
+                )
+
         first_time_seen = tag_id not in self.memory
         if first_time_seen:
             self.create_tag_memory(tag_id, semantics, msg, now_sec)
         else:
+            # Always reapply current semantics so stale persistent records are
+            # repaired after the YAML is corrected.
+            self.apply_current_semantics(tag_id, self.memory[tag_id])
             self.update_tag_memory(tag_id, msg, now_sec)
 
-        remembered = self.memory[tag_id]
-        self.ensure_memory_schema(remembered)
+        remembered = self.apply_current_semantics(
+            tag_id, self.memory[tag_id]
+        )
 
         # A new visual encounter is positive presence evidence, but camera
         # frames from the same continuous sighting are not counted repeatedly.
@@ -585,8 +624,13 @@ class RobotinoForagingMemory(Node):
         self.memory[tag_id] = data
 
         self.get_logger().info(
-            f"Remembered new tag {tag_id} ({data['tag_type']})"
+            f"Remembered new tag {tag_id} ({data['tag_type']}), "
+            f"is_energy_bank={data['is_energy_bank']}, "
+            f"resource_remaining={data['resource_remaining']:.3f}"
         )
+        # Do not rely only on the five-second timer. A newly discovered tag is
+        # important enough to persist immediately.
+        self.save_resource_memory()
 
     def update_tag_memory(self, tag_id, msg, now_sec):
         remembered = self.ensure_memory_schema(self.memory[tag_id])
@@ -890,7 +934,7 @@ class RobotinoForagingMemory(Node):
         robot_y = float(getattr(state, "robot_y_map", 0.0))
 
         for tag_id, raw_data in self.memory.items():
-            data = self.ensure_memory_schema(raw_data)
+            data = self.apply_current_semantics(tag_id, raw_data)
             if not data.get("is_energy_bank", False):
                 continue
 
@@ -947,6 +991,31 @@ class RobotinoForagingMemory(Node):
         self.set_if_available(
             state, "best_energy_worthiness", float(best_worthiness)
         )
+
+        if best_id != self.last_logged_best_energy_tag_id:
+            self.last_logged_best_energy_tag_id = best_id
+            if best_id >= 0:
+                self.get_logger().info(
+                    "Best energy bank -> tag %d | score=%.4f | "
+                    "worthiness=%.3f | presence=%.3f | reachability=%.3f | "
+                    "recharge=%.3f | observation_pose=(%.2f, %.2f, %.2f)"
+                    % (
+                        best_id,
+                        best_final_score,
+                        best_worthiness,
+                        best_presence,
+                        best_reachability,
+                        best_recharge,
+                        best_last_x,
+                        best_last_y,
+                        best_last_yaw,
+                    )
+                )
+            else:
+                self.get_logger().warn(
+                    "No usable remembered energy bank. "
+                    "Check observed tag IDs, semantics, and resource_remaining."
+                )
 
     def log_tag_reliability(self, tag_id, data):
         self.get_logger().info(

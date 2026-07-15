@@ -36,7 +36,7 @@ class RobotinoCognitiveSignals(Node):
         )
         self.declare_parameter(
             "mapping_complete_topic",
-            "/frontier_exploration/mapping_complete",
+            "/robotino/emdb/exploration_complete",
         )
         self.declare_parameter("mapping_progress_topic", "")
 
