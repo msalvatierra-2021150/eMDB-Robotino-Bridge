@@ -2,8 +2,9 @@ Experiment:
   name: main_loop
   class_name: cognitive_processes.main_loop.MainLoop
   new_executor: true
-  threads: 2
+  threads: 4
   parameters:
+    # Keep the MainLoop stopped while drive/goal signals are validated.
     iterations: 0
     trials: 20
     subgoals: false
@@ -25,6 +26,7 @@ LTM:
     - id: goodness
       class: core.file.FileGoodness
       file: robotino_goodness.txt
+
     - id: pnodes_success
       class: core.file.FilePNodesSuccess
       file: robotino_pnodes_success.txt
@@ -43,34 +45,151 @@ LTM:
             bearing_max: 3.141592653589793
 
     RobotPurpose:
-      - name: novelty_need
+      - name: energy_need
         class_name: cognitive_nodes.robot_purpose.RobotPurpose
         parameters:
           weight: 1.0
-          drive_id: novelty_drive
+          drive_id: energy_drive
           purpose_type: Need
           terminal: false
 
+      - name: resource_discovery_need
+        class_name: cognitive_nodes.robot_purpose.RobotPurpose
+        parameters:
+          weight: 0.9
+          drive_id: resource_knowledge_drive
+          purpose_type: Need
+          terminal: false
+
+      - name: exploration_mission
+        class_name: cognitive_nodes.robot_purpose.RobotPurpose
+        parameters:
+          weight: 0.7
+          drive_id: exploration_drive
+          purpose_type: Mission
+          terminal: false
+
+      - name: mission_completion
+        class_name: cognitive_nodes.robot_purpose.RobotPurpose
+        parameters:
+          weight: 1.0
+          drive_id: mission_drive
+          purpose_type: Mission
+          terminal: true
+
     Drive:
-      - name: novelty_drive
-        class_name: cognitive_nodes.novelty.DriveNovelty
+      - name: energy_drive
+        class_name: cognitive_nodes.drive.DriveExponential
+        parameters:
+          input_topic: /robotino/emdb/satisfaction/energy
+          input_msg: std_msgs.msg.Float32
+          min_eval: 0.0
+          neighbors:
+            - name: energy_need
+              node_type: RobotPurpose
+
+      - name: resource_knowledge_drive
+        class_name: cognitive_nodes.drive.DriveExponential
+        parameters:
+          input_topic: /robotino/emdb/satisfaction/resource_knowledge
+          input_msg: std_msgs.msg.Float32
+          min_eval: 0.0
+          neighbors:
+            - name: resource_discovery_need
+              node_type: RobotPurpose
+
+      - name: exploration_drive
+        class_name: cognitive_nodes.drive.DriveExponential
+        parameters:
+          input_topic: /robotino/emdb/satisfaction/exploration
+          input_msg: std_msgs.msg.Float32
+          min_eval: 0.0
+          neighbors:
+            - name: exploration_mission
+              node_type: RobotPurpose
+
+      - name: mission_drive
+        class_name: cognitive_nodes.drive.DriveExponential
+        parameters:
+          input_topic: /robotino/emdb/satisfaction/mission
+          input_msg: std_msgs.msg.Float32
+          min_eval: 0.0
+          neighbors:
+            - name: mission_completion
+              node_type: RobotPurpose
+
+    Goal:
+      - name: restore_energy_goal
+        class_name: cognitive_nodes.goal.GoalMotiven
         parameters:
           neighbors:
-            - name: novelty_need
-              node_type: RobotPurpose
+            - name: energy_drive
+              node_type: Drive
+
+      - name: discover_energy_resource_goal
+        class_name: cognitive_nodes.goal.GoalMotiven
+        parameters:
+          neighbors:
+            - name: resource_knowledge_drive
+              node_type: Drive
+
+      - name: complete_exploration_goal
+        class_name: cognitive_nodes.goal.GoalMotiven
+        parameters:
+          neighbors:
+            - name: exploration_drive
+              node_type: Drive
+
+      - name: complete_mission_goal
+        class_name: cognitive_nodes.goal.GoalMotiven
+        parameters:
+          neighbors:
+            - name: mission_drive
+              node_type: Drive
+
+    Policy:
+      - name: continue_exploring
+        class_name: cognitive_nodes.policy.PolicyBlocking
+        parameters:
+          service_msg: cognitive_node_interfaces.srv.Policy
+          service_name: /robotino/emdb/execute_policy
+
+      - name: search_for_energy
+        class_name: cognitive_nodes.policy.PolicyBlocking
+        parameters:
+          service_msg: cognitive_node_interfaces.srv.Policy
+          service_name: /robotino/emdb/execute_policy
+
+      - name: return_to_energy
+        class_name: cognitive_nodes.policy.PolicyBlocking
+        parameters:
+          service_msg: cognitive_node_interfaces.srv.Policy
+          service_name: /robotino/emdb/execute_policy
+
+      - name: go_to_goal
+        class_name: cognitive_nodes.policy.PolicyBlocking
+        parameters:
+          service_msg: cognitive_node_interfaces.srv.Policy
+          service_name: /robotino/emdb/execute_policy
 
   Connectors:
     - data: Space
       default_class: cognitive_nodes.space.SVMSpace
+
     - data: Perception
       default_class: cognitive_nodes.perception.Perception
+
     - data: PNode
       default_class: cognitive_nodes.pnode.PNode
+
     - data: CNode
       default_class: cognitive_nodes.cnode.CNode
+
     - data: Goal
       default_class: cognitive_nodes.goal.Goal
+
     - data: WorldModel
       default_class: cognitive_nodes.world_model.WorldModel
+
     - data: Policy
-      default_class: cognitive_nodes.policy.Policy
+      default_class: cognitive_nodes.policy.PolicyBlocking

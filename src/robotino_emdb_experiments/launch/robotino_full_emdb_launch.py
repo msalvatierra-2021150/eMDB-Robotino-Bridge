@@ -30,6 +30,7 @@ def generate_launch_description():
             "foraging_semantics.yaml",
         ]
     )
+    
 
     forwarded_arguments = {
         "detections_topic": LaunchConfiguration("detections_topic"),
@@ -49,6 +50,8 @@ def generate_launch_description():
         "config_file": LaunchConfiguration("config_file"),
         "experiment_package": LaunchConfiguration("experiment_package"),
         "experiment_file": LaunchConfiguration("experiment_file"),
+        "mapping_complete_topic": LaunchConfiguration("mapping_complete_topic"),
+        "mapping_progress_topic": LaunchConfiguration("mapping_progress_topic"),
     }
 
     return LaunchDescription(
@@ -131,9 +134,24 @@ def generate_launch_description():
                 default_value="robotino_semantic_experiment.yaml",
                 description="Robotino e-MDB experiment YAML.",
             ),
+            DeclareLaunchArgument(
+                "mapping_complete_topic",
+                default_value="/frontier_exploration/mapping_complete",
+                description=(
+                    "std_msgs/Bool topic that becomes true when mapping is complete."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "mapping_progress_topic",
+                default_value="",
+                description=(
+                    "Optional std_msgs/Float32 mapping progress topic in [0, 1]."
+                ),
+            ),
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(semantic_experiment_launch),
                 launch_arguments=forwarded_arguments.items(),
             ),
+
         ]
     )

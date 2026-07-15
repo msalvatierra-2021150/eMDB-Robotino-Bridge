@@ -29,6 +29,8 @@ def launch_setup(context: LaunchContext, *args, **kwargs):
     robot_frame = LaunchConfiguration("robot_frame")
     camera_frame = LaunchConfiguration("camera_frame")
     semantics_file = LaunchConfiguration("semantics_file")
+    mapping_complete_topic = LaunchConfiguration('mapping_complete_topic')
+    mapping_progress_topic = LaunchConfiguration('mapping_progress_topic') 
 
     enable_nav2_execution = LaunchConfiguration("enable_nav2_execution")
     nav2_action_name = LaunchConfiguration("nav2_action_name")
@@ -123,6 +125,29 @@ def launch_setup(context: LaunchContext, *args, **kwargs):
         ],
     )
 
+    # 4. Factual-state adapter for official GII DriveExponential nodes.
+    cognitive_signals_node = Node(
+        package='robotino_emdb_motivation',
+        executable='cognitive_signals',
+        name='robotino_cognitive_signals',
+        output='screen',
+        emulate_tty=True,
+        parameters=[{
+            'foraging_topic': '/robotino/emdb/foraging_state',
+            'mapping_complete_topic': mapping_complete_topic,
+            'mapping_progress_topic': mapping_progress_topic,
+            'energy_satisfaction_topic':
+                '/robotino/emdb/satisfaction/energy',
+            'resource_satisfaction_topic':
+                '/robotino/emdb/satisfaction/resource_knowledge',
+            'exploration_satisfaction_topic':
+                '/robotino/emdb/satisfaction/exploration',
+            'mission_satisfaction_topic':
+                '/robotino/emdb/satisfaction/mission',
+            'publish_period_s': 0.2,
+        }]
+    )
+
     foraging_memory_node = Node(
         package="robotino_emdb_memory",
         executable="foraging_memory",
@@ -197,11 +222,11 @@ def launch_setup(context: LaunchContext, *args, **kwargs):
         TimerAction(period=1.0, actions=[apriltag_tf_bridge_node]),
         TimerAction(period=2.0, actions=[foraging_memory_node]),
         TimerAction(period=2.0, actions=[load_commander_config]),
+        TimerAction(period=3.0,actions=[cognitive_signals_node]), 
         TimerAction(period=3.0, actions=[policy_execution_bridge_node]),
-        TimerAction(period=5.0, actions=[load_experiment_config]),
         TimerAction(period=6.0, actions=[policy_executor_node]),
+        TimerAction(period=5.0, actions=[load_experiment_config]),
     ]
-
 
 def generate_launch_description():
     default_semantics_file = PathJoinSubstitution(
@@ -292,6 +317,22 @@ def generate_launch_description():
                 default_value="robotino_semantic_experiment.yaml",
                 description="Robotino e-MDB experiment YAML.",
             ),
-            OpaqueFunction(function=launch_setup),
+            DeclareLaunchArgument(
+                "mapping_complete_topic",
+                default_value="/frontier_exploration/mapping_complete",
+                description=(
+                    "std_msgs/Bool topic published when frontier mapping is complete."
+                ),
+            ),
+
+            DeclareLaunchArgument(
+                "mapping_progress_topic",
+                default_value="",
+                description=(
+                    "Optional std_msgs/Float32 mapping progress topic in [0, 1]. "
+                    "Leave empty when only mapping_complete is available."
+                ),
+            ),
+                        OpaqueFunction(function=launch_setup),
         ]
     )
