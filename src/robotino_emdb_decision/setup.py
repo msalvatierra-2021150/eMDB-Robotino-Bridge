@@ -17,7 +17,7 @@ setup(
     zip_safe=True,
     maintainer="mike",
     maintainer_email="salvmike0@gmail.com",
-    description="Robotino adapters for official GII e-MDB policy execution.",
+    description="Robotino adapters and seeded nodes for official GII e-MDB.",
     license="MIT",
     extras_require={"test": ["pytest"]},
     entry_points={
@@ -26,8 +26,8 @@ setup(
             "robotino_emdb_decision.robotino_policy_selector:main",
             "policy_execution_bridge = "
             "robotino_emdb_decision.robotino_policy_execution_bridge:main",
-            "demo_autonomy = "
-            "robotino_emdb_decision.robotino_demo_autonomy:main",
+            "robotino_static_world = "
+            "robotino_emdb_decision.robotino_cognitive_nodes:main",
         ],
     },
 )

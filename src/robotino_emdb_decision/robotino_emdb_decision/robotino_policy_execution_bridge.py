@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -76,6 +77,9 @@ class RobotinoPolicyExecutionBridge(Node):
         )
         self.declare_parameter("execution_timeout_s", 120.0)
         self.declare_parameter("minimum_energy_bank_score", 0.0)
+        self.declare_parameter("minimum_energy_bank_worthiness", 0.10)
+        self.declare_parameter("wait_safe_duration_s", 1.0)
+        self.declare_parameter("minimum_exploration_cycle_s", 1.0)
 
         self.service_name = str(self.get_parameter("service_name").value)
         self.foraging_topic = str(self.get_parameter("foraging_topic").value)
@@ -90,6 +94,29 @@ class RobotinoPolicyExecutionBridge(Node):
         self.minimum_energy_bank_score = max(
             0.0,
             float(self.get_parameter("minimum_energy_bank_score").value),
+        )
+        self.minimum_energy_bank_worthiness = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    self.get_parameter(
+                        "minimum_energy_bank_worthiness"
+                    ).value
+                ),
+            ),
+        )
+        self.wait_safe_duration_s = max(
+            0.0,
+            float(self.get_parameter("wait_safe_duration_s").value),
+        )
+        self.minimum_exploration_cycle_s = max(
+            0.0,
+            float(
+                self.get_parameter(
+                    "minimum_exploration_cycle_s"
+                ).value
+            ),
         )
 
         self.callback_group = ReentrantCallbackGroup()
@@ -143,6 +170,16 @@ class RobotinoPolicyExecutionBridge(Node):
         """Translate one official e-MDB policy request and wait for its outcome."""
         policy_name = self.canonical_policy_name(request.policy)
 
+        if policy_name == "wait_safe":
+            self.get_logger().info(
+                "Executing e-MDB wait_safe fallback for "
+                f"{self.wait_safe_duration_s:.2f} s"
+            )
+            if self.wait_safe_duration_s > 0.0:
+                time.sleep(self.wait_safe_duration_s)
+            response.success = True
+            return response
+
         with self.pending_lock:
             if self.pending is not None:
                 self.get_logger().warn(
@@ -175,6 +212,7 @@ class RobotinoPolicyExecutionBridge(Node):
             )
             self.pending = pending
 
+        dispatch_started = time.monotonic()
         self.get_logger().info(
             "Dispatching official e-MDB policy "
             f"'{policy_name}' as Robotino policy_id={command.policy_id}, "
@@ -198,6 +236,25 @@ class RobotinoPolicyExecutionBridge(Node):
             return response
 
         response.success = bool(outcome.policy_success)
+
+        # The current frontier executor acknowledges exploration immediately
+        # while a separate frontier process keeps moving the robot. Without a
+        # minimum policy window, MainLoop can consume every configured
+        # iteration before energy or mapping state changes. Keep e-MDB in
+        # control by allowing one fresh decision at a bounded cadence.
+        if (
+            response.success
+            and policy_name in {
+                "continue_exploring",
+                "search_for_energy",
+            }
+            and self.minimum_exploration_cycle_s > 0.0
+        ):
+            elapsed = time.monotonic() - dispatch_started
+            remaining = self.minimum_exploration_cycle_s - elapsed
+            if remaining > 0.0:
+                time.sleep(remaining)
+
         self.get_logger().info(
             f"Official e-MDB policy '{policy_name}' completed: "
             f"success={response.success}, "
@@ -306,6 +363,9 @@ class RobotinoPolicyExecutionBridge(Node):
         if policy_name == "return_to_energy":
             best_tag_id = int(state.best_energy_tag_id)
             best_score = float(state.best_energy_score)
+            best_worthiness = float(
+                getattr(state, "best_energy_worthiness", 0.0)
+            )
 
             if best_tag_id < 0:
                 self.get_logger().warn(
@@ -318,6 +378,14 @@ class RobotinoPolicyExecutionBridge(Node):
                     "Cannot return to energy: best bank score "
                     f"{best_score:.3f} is below threshold "
                     f"{self.minimum_energy_bank_score:.3f}."
+                )
+                return None
+
+            if best_worthiness < self.minimum_energy_bank_worthiness:
+                self.get_logger().warn(
+                    "Cannot return to energy: best bank worthiness "
+                    f"{best_worthiness:.3f} is below threshold "
+                    f"{self.minimum_energy_bank_worthiness:.3f}."
                 )
                 return None
 
@@ -442,6 +510,8 @@ class RobotinoPolicyExecutionBridge(Node):
             "return_to_energy": "return_to_energy",
             "goal_reached": "go_to_goal",
             "go_to_goal": "go_to_goal",
+            "wait": "wait_safe",
+            "wait_safe": "wait_safe",
         }
         normalized = str(raw_name).strip().lower()
         return aliases.get(normalized, normalized)

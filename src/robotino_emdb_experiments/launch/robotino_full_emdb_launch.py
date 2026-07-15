@@ -40,16 +40,6 @@ def generate_launch_description():
         "semantics_file": LaunchConfiguration("semantics_file"),
         "mapping_complete_topic": LaunchConfiguration("mapping_complete_topic"),
         "mapping_progress_topic": LaunchConfiguration("mapping_progress_topic"),
-        "enable_demo_autonomy": LaunchConfiguration("enable_demo_autonomy"),
-        "demo_low_energy_threshold": LaunchConfiguration(
-            "demo_low_energy_threshold"
-        ),
-        "demo_resume_energy_threshold": LaunchConfiguration(
-            "demo_resume_energy_threshold"
-        ),
-        "demo_minimum_bank_worthiness": LaunchConfiguration(
-            "demo_minimum_bank_worthiness"
-        ),
         "enable_nav2_execution": LaunchConfiguration("enable_nav2_execution"),
         "nav2_action_name": LaunchConfiguration("nav2_action_name"),
         "publish_exploration_control": LaunchConfiguration(
@@ -104,32 +94,6 @@ def generate_launch_description():
                 "mapping_progress_topic",
                 default_value="",
                 description="Optional Float32 topic with exploration progress in [0, 1].",
-            ),
-            DeclareLaunchArgument(
-                "enable_demo_autonomy",
-                default_value="true",
-                description=(
-                    "Enable the deterministic worthiness-foraging demo "
-                    "coordinator."
-                ),
-            ),
-            DeclareLaunchArgument(
-                "demo_low_energy_threshold",
-                default_value="0.35",
-                description="Energy level that starts resource recovery.",
-            ),
-            DeclareLaunchArgument(
-                "demo_resume_energy_threshold",
-                default_value="0.70",
-                description="Energy level that resumes normal exploration.",
-            ),
-            DeclareLaunchArgument(
-                "demo_minimum_bank_worthiness",
-                default_value="0.10",
-                description=(
-                    "Minimum remembered-bank worthiness accepted by the "
-                    "demo coordinator."
-                ),
             ),
             DeclareLaunchArgument(
                 "enable_nav2_execution",

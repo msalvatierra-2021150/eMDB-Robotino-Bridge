@@ -170,6 +170,7 @@ class RobotinoForagingMemory(Node):
 
         self.goal_satisfied = False
         self.last_logged_best_energy_tag_id = None
+        self.last_best_candidate_summary = None
         self.latest_state = self.create_empty_state()
 
         # ------------------------------------------------------------------
@@ -218,10 +219,19 @@ class RobotinoForagingMemory(Node):
 
     @staticmethod
     def probability(positive, negative):
-        total = float(positive) + float(negative)
+        try:
+            positive = float(positive)
+            negative = float(negative)
+        except (TypeError, ValueError):
+            return 0.5
+        if not math.isfinite(positive) or not math.isfinite(negative):
+            return 0.5
+        positive = max(0.0, positive)
+        negative = max(0.0, negative)
+        total = positive + negative
         if total <= 0.0:
             return 0.5
-        return float(positive) / total
+        return positive / total
 
     @staticmethod
     def set_if_available(message, field_name, value):
@@ -909,13 +919,17 @@ class RobotinoForagingMemory(Node):
         )
 
     def fill_best_energy_bank(self, state):
-        """Rank banks by current foraging value multiplied by memory.
+        """Rank usable banks using the pose Robotino will actually navigate to.
 
-        foraging_score = remaining_resource / (1 + Euclidean distance)
-        final_score = foraging_score * memory_worthiness
+        The executor navigates to the saved observation pose, not directly to
+        the tag coordinate.  Therefore ranking first uses the saved observation
+        pose for travel cost and falls back to the tag pose only when needed.
 
-        Nav2 path length should replace Euclidean distance later when the target
-        selector has a path-cost service available.
+        A candidate is usable only when:
+          * current semantics classify it as an energy bank;
+          * remaining resource is positive;
+          * a finite target pose exists;
+          * reliability and resulting score are finite and positive.
         """
         best_id = -1
         best_final_score = 0.0
@@ -932,45 +946,100 @@ class RobotinoForagingMemory(Node):
 
         robot_x = float(getattr(state, "robot_x_map", 0.0))
         robot_y = float(getattr(state, "robot_y_map", 0.0))
+        if not math.isfinite(robot_x):
+            robot_x = 0.0
+        if not math.isfinite(robot_y):
+            robot_y = 0.0
+
+        candidate_summaries = []
 
         for tag_id, raw_data in self.memory.items():
             data = self.apply_current_semantics(tag_id, raw_data)
+
             if not data.get("is_energy_bank", False):
+                candidate_summaries.append(f"{tag_id}:not_energy")
                 continue
 
             remaining = float(data.get("resource_remaining", 0.0))
-            if remaining <= 0.0:
+            if not math.isfinite(remaining) or remaining <= 0.0:
+                candidate_summaries.append(
+                    f"{tag_id}:empty({remaining!r})"
+                )
                 continue
 
-            dx = float(data["tag_x_map"]) - robot_x
-            dy = float(data["tag_y_map"]) - robot_y
-            distance = math.hypot(dx, dy)
+            tag_x = float(data.get("tag_x_map", math.nan))
+            tag_y = float(data.get("tag_y_map", math.nan))
+            obs_x = float(data.get("last_seen_robot_x_map", math.nan))
+            obs_y = float(data.get("last_seen_robot_y_map", math.nan))
+            obs_yaw = float(data.get("last_seen_robot_yaw_map", math.nan))
 
+            # The observation pose is the real Nav2 target. Use it for cost.
+            if all(math.isfinite(v) for v in (obs_x, obs_y, obs_yaw)):
+                target_x = obs_x
+                target_y = obs_y
+                target_source = "observation"
+            elif all(math.isfinite(v) for v in (tag_x, tag_y)):
+                target_x = tag_x
+                target_y = tag_y
+                target_source = "tag"
+                # Keep the bridge fields finite for old records.
+                obs_x = tag_x
+                obs_y = tag_y
+                obs_yaw = 0.0
+            else:
+                candidate_summaries.append(f"{tag_id}:invalid_pose")
+                continue
+
+            distance = math.hypot(target_x - robot_x, target_y - robot_y)
             foraging_score = remaining / (1.0 + distance)
-            memory_worthiness = self.worthiness(data)
+            presence = self.presence_confidence(data)
+            reachability = self.reachability_confidence(data)
+            recharge = self.recharge_reliability(data)
+            memory_worthiness = presence * reachability * recharge
             final_score = foraging_score * memory_worthiness
 
-            if final_score > best_final_score:
+            if not all(
+                math.isfinite(v)
+                for v in (
+                    distance,
+                    foraging_score,
+                    presence,
+                    reachability,
+                    recharge,
+                    memory_worthiness,
+                    final_score,
+                )
+            ):
+                candidate_summaries.append(f"{tag_id}:non_finite_score")
+                continue
+
+            candidate_summaries.append(
+                f"{tag_id}:ok(source={target_source},remaining={remaining:.3f},"
+                f"distance={distance:.3f},worthiness={memory_worthiness:.3f},"
+                f"score={final_score:.4f})"
+            )
+
+            if best_id < 0 or final_score > best_final_score:
                 best_final_score = final_score
                 best_foraging_score = foraging_score
                 best_worthiness = memory_worthiness
-                best_presence = self.presence_confidence(data)
-                best_reachability = self.reachability_confidence(data)
-                best_recharge = self.recharge_reliability(data)
+                best_presence = presence
+                best_reachability = reachability
+                best_recharge = recharge
                 best_id = int(tag_id)
-                best_x = float(data["tag_x_map"])
-                best_y = float(data["tag_y_map"])
-                best_last_x = float(data["last_seen_robot_x_map"])
-                best_last_y = float(data["last_seen_robot_y_map"])
-                best_last_yaw = float(data["last_seen_robot_yaw_map"])
+                best_x = tag_x if math.isfinite(tag_x) else target_x
+                best_y = tag_y if math.isfinite(tag_y) else target_y
+                best_last_x = obs_x
+                best_last_y = obs_y
+                best_last_yaw = obs_yaw
 
         state.best_energy_tag_id = int(best_id)
-        state.best_energy_x_map = best_x
-        state.best_energy_y_map = best_y
+        state.best_energy_x_map = float(best_x)
+        state.best_energy_y_map = float(best_y)
         state.best_energy_score = float(best_final_score)
-        state.best_energy_last_seen_robot_x_map = best_last_x
-        state.best_energy_last_seen_robot_y_map = best_last_y
-        state.best_energy_last_seen_robot_yaw_map = best_last_yaw
+        state.best_energy_last_seen_robot_x_map = float(best_last_x)
+        state.best_energy_last_seen_robot_y_map = float(best_last_y)
+        state.best_energy_last_seen_robot_yaw_map = float(best_last_yaw)
 
         self.set_if_available(
             state, "best_energy_foraging_score", float(best_foraging_score)
@@ -991,6 +1060,11 @@ class RobotinoForagingMemory(Node):
         self.set_if_available(
             state, "best_energy_worthiness", float(best_worthiness)
         )
+
+        summary = " | ".join(candidate_summaries) or "memory_empty"
+        if summary != self.last_best_candidate_summary:
+            self.last_best_candidate_summary = summary
+            self.get_logger().info(f"Energy-bank candidates: {summary}")
 
         if best_id != self.last_logged_best_energy_tag_id:
             self.last_logged_best_energy_tag_id = best_id
@@ -1014,7 +1088,7 @@ class RobotinoForagingMemory(Node):
             else:
                 self.get_logger().warn(
                     "No usable remembered energy bank. "
-                    "Check observed tag IDs, semantics, and resource_remaining."
+                    f"Candidates: {summary}"
                 )
 
     def log_tag_reliability(self, tag_id, data):

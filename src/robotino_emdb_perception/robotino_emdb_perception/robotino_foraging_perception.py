@@ -23,10 +23,7 @@ class RobotinoForagingPerception(Perception):
     def __init__(
         self,
         name="foraging_state",
-        class_name=(
-            "robotino_emdb_perception.robotino_foraging_perception."
-            "RobotinoForagingPerception"
-        ),
+        class_name="cognitive_nodes.perception.Perception",
         default_msg=None,
         default_topic=None,
         normalize_data=None,
@@ -34,14 +31,12 @@ class RobotinoForagingPerception(Perception):
     ):
         super().__init__(
             name=name,
-            class_name=class_name,
+            class_name="cognitive_nodes.perception.Perception",
             default_msg=default_msg,
             default_topic=default_topic,
             normalize_data=normalize_data or {},
             **params,
         )
-        self.node_type = "Perception"
-        self.activation.node_type = "Perception"
 
     @staticmethod
     def clamp(value, min_value=0.0, max_value=1.0):
@@ -190,10 +185,7 @@ def main(args=None):
 
     node = RobotinoForagingPerception(
         name="foraging_state",
-        class_name=(
-            "robotino_emdb_perception.robotino_foraging_perception."
-            "RobotinoForagingPerception"
-        ),
+        class_name="cognitive_nodes.perception.Perception",
         default_msg=(
             "robotino_emdb_interfaces.msg.RobotinoForagingState"
         ),

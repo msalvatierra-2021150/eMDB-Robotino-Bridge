@@ -1,0 +1,319 @@
+Experiment:
+  name: main_loop
+  class_name: cognitive_processes.main_loop.MainLoop
+  new_executor: true
+  threads: 4
+  parameters:
+    iterations: 0
+    trials: 100000
+    subgoals: false
+    softmax_selection: false
+    softmax_temperature: 0.3
+    kill_on_finish: false
+
+Control:
+  id: robotino_control
+  control_topic: /main_loop/control
+  control_msg: cognitive_processes_interfaces.msg.ControlMsg
+  episodes_topic: /main_loop/episodes
+  episodes_msg: cognitive_node_interfaces.msg.Episode
+
+LTM:
+  Files:
+    - id: goodness
+      class: core.file.FileGoodness
+      file: robotino_goodness.txt
+    - id: pnodes_success
+      class: core.file.FilePNodesSuccess
+      file: robotino_pnodes_success.txt
+
+  Nodes:
+    Perception:
+      - name: foraging_state
+        class_name: robotino_emdb_perception.robotino_foraging_perception.RobotinoForagingPerception
+        parameters:
+          default_msg: robotino_emdb_interfaces.msg.RobotinoForagingState
+          default_topic: /robotino/emdb/foraging_state
+          normalize_data:
+            distance_min: 0.0
+            distance_max: 3.0
+            bearing_min: -3.141592653589793
+            bearing_max: 3.141592653589793
+
+      - name: robotino_context
+        class_name: robotino_emdb_perception.robotino_context_perception.RobotinoContextPerception
+        parameters:
+          default_msg: robotino_emdb_interfaces.msg.RobotinoForagingState
+          default_topic: /robotino/emdb/foraging_state
+          # Mapping completion is consumed from the already configured
+          # cognitive-signals adapter, avoiding a second hardcoded frontier topic.
+          mapping_complete_topic: ""
+          exploration_satisfaction_topic: /robotino/emdb/satisfaction/exploration
+          # Leave empty when the frontier package publishes only mapping_complete.
+          frontiers_available_topic: ""
+          low_energy_threshold: 0.35
+          resume_energy_threshold: 0.70
+          minimum_bank_worthiness: 0.10
+
+    RobotPurpose:
+      - name: energy_need
+        class_name: cognitive_nodes.robot_purpose.RobotPurpose
+        parameters:
+          weight: 1.0
+          drive_id: energy_drive
+          purpose_type: Need
+          terminal: false
+
+      - name: resource_discovery_need
+        class_name: cognitive_nodes.robot_purpose.RobotPurpose
+        parameters:
+          weight: 0.9
+          drive_id: resource_knowledge_drive
+          purpose_type: Need
+          terminal: false
+
+      - name: exploration_mission
+        class_name: cognitive_nodes.robot_purpose.RobotPurpose
+        parameters:
+          weight: 0.7
+          drive_id: exploration_drive
+          purpose_type: Mission
+          terminal: false
+
+      - name: mission_completion
+        class_name: cognitive_nodes.robot_purpose.RobotPurpose
+        parameters:
+          weight: 1.0
+          drive_id: mission_drive
+          purpose_type: Mission
+          # Keep false until a deterministic Gazebo world-reset service exists.
+          terminal: false
+
+    Drive:
+      - name: energy_drive
+        class_name: cognitive_nodes.drive.DriveExponential
+        parameters:
+          input_topic: /robotino/emdb/satisfaction/energy
+          input_msg: std_msgs.msg.Float32
+          min_eval: 0.0
+          neighbors:
+            - {name: energy_need, node_type: RobotPurpose}
+
+      - name: resource_knowledge_drive
+        class_name: cognitive_nodes.drive.DriveExponential
+        parameters:
+          input_topic: /robotino/emdb/satisfaction/resource_knowledge
+          input_msg: std_msgs.msg.Float32
+          min_eval: 0.0
+          neighbors:
+            - {name: resource_discovery_need, node_type: RobotPurpose}
+
+      - name: exploration_drive
+        class_name: cognitive_nodes.drive.DriveExponential
+        parameters:
+          input_topic: /robotino/emdb/satisfaction/exploration
+          input_msg: std_msgs.msg.Float32
+          min_eval: 0.0
+          neighbors:
+            - {name: exploration_mission, node_type: RobotPurpose}
+
+      - name: mission_drive
+        class_name: cognitive_nodes.drive.DriveExponential
+        parameters:
+          input_topic: /robotino/emdb/satisfaction/mission
+          input_msg: std_msgs.msg.Float32
+          min_eval: 0.0
+          neighbors:
+            - {name: mission_completion, node_type: RobotPurpose}
+
+    Goal:
+      - name: restore_energy_goal
+        class_name: cognitive_nodes.goal.GoalMotiven
+        parameters:
+          neighbors:
+            - {name: energy_drive, node_type: Drive}
+
+      - name: discover_energy_resource_goal
+        class_name: cognitive_nodes.goal.GoalMotiven
+        parameters:
+          neighbors:
+            - {name: resource_knowledge_drive, node_type: Drive}
+
+      - name: complete_exploration_goal
+        class_name: cognitive_nodes.goal.GoalMotiven
+        parameters:
+          neighbors:
+            - {name: exploration_drive, node_type: Drive}
+
+      - name: complete_mission_goal
+        class_name: cognitive_nodes.goal.GoalMotiven
+        parameters:
+          neighbors:
+            - {name: mission_drive, node_type: Drive}
+
+      - name: safe_operation_goal
+        class_name: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoSafetyGoal
+        parameters:
+          activation_value: 1.0
+          neighbors:
+            - {name: robotino_context, node_type: Perception}
+
+    PNode:
+      - name: p_explore
+        class_name: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoSeededPNode
+        parameters:
+          context: explore
+          context_sensor: robotino_context
+          space_class: cognitive_nodes.space.PointBasedSpace
+          neighbors:
+            - {name: robotino_context, node_type: Perception}
+
+      - name: p_search_energy
+        class_name: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoSeededPNode
+        parameters:
+          context: search_energy
+          context_sensor: robotino_context
+          space_class: cognitive_nodes.space.PointBasedSpace
+          neighbors:
+            - {name: robotino_context, node_type: Perception}
+
+      - name: p_return_energy
+        class_name: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoSeededPNode
+        parameters:
+          context: return_energy
+          context_sensor: robotino_context
+          space_class: cognitive_nodes.space.PointBasedSpace
+          neighbors:
+            - {name: robotino_context, node_type: Perception}
+
+      - name: p_go_goal
+        class_name: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoSeededPNode
+        parameters:
+          context: go_goal
+          context_sensor: robotino_context
+          space_class: cognitive_nodes.space.PointBasedSpace
+          neighbors:
+            - {name: robotino_context, node_type: Perception}
+
+      - name: p_wait_safe
+        class_name: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoSeededPNode
+        parameters:
+          context: wait_safe
+          context_sensor: robotino_context
+          space_class: cognitive_nodes.space.PointBasedSpace
+          neighbors:
+            - {name: robotino_context, node_type: Perception}
+
+    WorldModel:
+      - name: robotino_world
+        class_name: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoStaticWorldModel
+        parameters:
+          activation_value: 1.0
+          neighbors:
+            - {name: robotino_context, node_type: Perception}
+
+    CNode:
+      - name: c_explore
+        class_name: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoCNode
+        parameters:
+          neighbors:
+            - {name: p_explore, node_type: PNode}
+            - {name: complete_exploration_goal, node_type: Goal}
+            - {name: robotino_world, node_type: WorldModel}
+
+      - name: c_search_energy
+        class_name: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoCNode
+        parameters:
+          neighbors:
+            - {name: p_search_energy, node_type: PNode}
+            - {name: discover_energy_resource_goal, node_type: Goal}
+            - {name: robotino_world, node_type: WorldModel}
+
+      - name: c_return_energy
+        class_name: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoCNode
+        parameters:
+          neighbors:
+            - {name: p_return_energy, node_type: PNode}
+            - {name: restore_energy_goal, node_type: Goal}
+            - {name: robotino_world, node_type: WorldModel}
+
+      - name: c_go_goal
+        class_name: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoCNode
+        parameters:
+          neighbors:
+            - {name: p_go_goal, node_type: PNode}
+            - {name: complete_mission_goal, node_type: Goal}
+            - {name: robotino_world, node_type: WorldModel}
+
+      - name: c_wait_safe
+        class_name: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoCNode
+        parameters:
+          neighbors:
+            - {name: p_wait_safe, node_type: PNode}
+            - {name: safe_operation_goal, node_type: Goal}
+            - {name: robotino_world, node_type: WorldModel}
+
+    Policy:
+      - name: continue_exploring
+        class_name: cognitive_nodes.policy.PolicyBlocking
+        parameters:
+          service_msg: cognitive_node_interfaces.srv.Policy
+          service_name: /robotino/emdb/execute_policy
+          neighbors:
+            - {name: c_explore, node_type: CNode}
+
+      - name: search_for_energy
+        class_name: cognitive_nodes.policy.PolicyBlocking
+        parameters:
+          service_msg: cognitive_node_interfaces.srv.Policy
+          service_name: /robotino/emdb/execute_policy
+          neighbors:
+            - {name: c_search_energy, node_type: CNode}
+
+      - name: return_to_energy
+        class_name: cognitive_nodes.policy.PolicyBlocking
+        parameters:
+          service_msg: cognitive_node_interfaces.srv.Policy
+          service_name: /robotino/emdb/execute_policy
+          neighbors:
+            - {name: c_return_energy, node_type: CNode}
+
+      - name: go_to_goal
+        class_name: cognitive_nodes.policy.PolicyBlocking
+        parameters:
+          service_msg: cognitive_node_interfaces.srv.Policy
+          service_name: /robotino/emdb/execute_policy
+          neighbors:
+            - {name: c_go_goal, node_type: CNode}
+
+      - name: wait_safe
+        class_name: cognitive_nodes.policy.PolicyBlocking
+        parameters:
+          service_msg: cognitive_node_interfaces.srv.Policy
+          service_name: /robotino/emdb/execute_policy
+          neighbors:
+            - {name: c_wait_safe, node_type: CNode}
+
+  Connectors:
+    - data: Space
+      default_class: cognitive_nodes.space.PointBasedSpace
+
+    - data: Perception
+      default_class: cognitive_nodes.perception.Perception
+
+    - data: PNode
+      default_class: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoSeededPNode
+      parameters:
+        space_class: cognitive_nodes.space.PointBasedSpace
+
+    - data: CNode
+      default_class: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoCNode
+
+    - data: Goal
+      default_class: cognitive_nodes.goal.GoalMotiven
+
+    - data: WorldModel
+      default_class: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoStaticWorldModel
+
+    - data: Policy
+      default_class: cognitive_nodes.policy.PolicyBlocking
