@@ -177,7 +177,12 @@ def launch_setup(context: LaunchContext, *args, **kwargs):
                 "foraging_topic": "/robotino/emdb/foraging_state",
                 "selected_policy_topic": "/robotino/emdb/selected_policy",
                 "outcome_topic": "/robotino/emdb/policy_outcome",
+                "mapping_complete_topic": mapping_complete_topic,
+                "exploration_satisfaction_topic":
+                    "/robotino/emdb/satisfaction/exploration",
                 "execution_timeout_s": 120.0,
+                "low_energy_threshold": 0.35,
+                "resume_energy_threshold": 0.70,
                 "minimum_energy_bank_score": 0.0,
                 "minimum_energy_bank_worthiness": 0.10,
                 "wait_safe_duration_s": 1.0,
@@ -197,6 +202,15 @@ def launch_setup(context: LaunchContext, *args, **kwargs):
                 "policy_topic": "/robotino/emdb/selected_policy",
                 "foraging_topic": "/robotino/emdb/foraging_state",
                 "outcome_topic": "/robotino/emdb/policy_outcome",
+                "mapping_complete_topic": mapping_complete_topic,
+                "map_topic": "/map",
+                "wander_random_seed": ParameterValue(
+                    random_seed,
+                    value_type=int,
+                ),
+                "resume_energy_threshold": 0.70,
+                "minimum_energy_bank_score": 0.0,
+                "minimum_energy_bank_worthiness": 0.10,
                 "nav2_action_name": nav2_action_name,
                 "map_frame": map_frame,
                 "enable_nav2_execution": ParameterValue(

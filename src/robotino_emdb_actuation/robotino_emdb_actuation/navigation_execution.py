@@ -21,6 +21,11 @@ class NavigationExecutionMixin:
         if context is None:
             return
 
+        mode = str(context.get("navigation_mode", "tag"))
+        resume_after_failure = (
+            False if mode == "wander" else self.resume_exploration_after_failure
+        )
+
         if not self.nav2_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().error(
                 "Nav2 NavigateToPose action server is unavailable."
@@ -29,7 +34,7 @@ class NavigationExecutionMixin:
                 generation,
                 success=False,
                 failure_reason=constants.FAILURE_NAVIGATION_FAILED,
-                resume_exploration=self.resume_exploration_after_failure,
+                resume_exploration=resume_after_failure,
                 navigation_result=RobotinoPolicyOutcome.NAV_FAILED,
             )
             return
@@ -52,6 +57,11 @@ class NavigationExecutionMixin:
         if context is None:
             return
 
+        mode = str(context.get("navigation_mode", "tag"))
+        resume_after_failure = (
+            False if mode == "wander" else self.resume_exploration_after_failure
+        )
+
         try:
             goal_handle = future.result()
         except Exception as ex:  # noqa: BLE001
@@ -60,7 +70,7 @@ class NavigationExecutionMixin:
                 generation,
                 success=False,
                 failure_reason=constants.FAILURE_NAVIGATION_FAILED,
-                resume_exploration=self.resume_exploration_after_failure,
+                resume_exploration=resume_after_failure,
                 navigation_result=RobotinoPolicyOutcome.NAV_FAILED,
             )
             return
@@ -71,13 +81,15 @@ class NavigationExecutionMixin:
                 generation,
                 success=False,
                 failure_reason=constants.FAILURE_GOAL_REJECTED,
-                resume_exploration=self.resume_exploration_after_failure,
+                resume_exploration=resume_after_failure,
                 navigation_result=RobotinoPolicyOutcome.NAV_FAILED,
             )
             return
 
         self.active_navigation_goal_handle = goal_handle
-        self.get_logger().info("Nav2 approach goal accepted.")
+        if mode == "wander":
+            self.set_wandering_active(True)
+        self.get_logger().info(f"Nav2 {mode} goal accepted.")
 
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(
@@ -94,6 +106,10 @@ class NavigationExecutionMixin:
             return
 
         self.active_navigation_goal_handle = None
+        mode = str(context.get("navigation_mode", "tag"))
+        resume_after_failure = (
+            False if mode == "wander" else self.resume_exploration_after_failure
+        )
 
         try:
             wrapped_result = future.result()
@@ -106,7 +122,16 @@ class NavigationExecutionMixin:
 
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.stop_robot()
-            self.enter_interaction_wait(generation)
+            if mode == "wander":
+                self.finish_execution(
+                    generation,
+                    success=True,
+                    failure_reason=constants.FAILURE_NONE,
+                    resume_exploration=False,
+                    navigation_result=RobotinoPolicyOutcome.NAV_SUCCEEDED,
+                )
+            else:
+                self.enter_interaction_wait(generation)
             return
 
         if status == GoalStatus.STATUS_CANCELED:
@@ -123,6 +148,6 @@ class NavigationExecutionMixin:
             generation,
             success=False,
             failure_reason=failure_reason,
-            resume_exploration=self.resume_exploration_after_failure,
+            resume_exploration=resume_after_failure,
             navigation_result=navigation_result,
         )

@@ -155,6 +155,15 @@ LTM:
         neighbors:
         - name: robotino_context
           node_type: Perception
+    - name: p_wander
+      class_name: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoSeededPNode
+      parameters:
+        context: wander
+        context_sensor: robotino_context
+        space_class: cognitive_nodes.space.PointBasedSpace
+        neighbors:
+        - name: robotino_context
+          node_type: Perception
     - name: p_search_energy
       class_name: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoSeededPNode
       parameters:
@@ -210,13 +219,27 @@ LTM:
           node_type: Goal
         - name: robotino_world
           node_type: WorldModel
+    - name: c_wander
+      class_name: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoCNode
+      parameters:
+        neighbors:
+        - name: p_wander
+          node_type: PNode
+        # Mapping completion has already satisfied complete_exploration_goal.
+        # The structural safety goal keeps this post-mapping behavior selectable.
+        - name: safe_operation_goal
+          node_type: Goal
+        - name: robotino_world
+          node_type: WorldModel
     - name: c_search_energy
       class_name: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoCNode
       parameters:
         neighbors:
         - name: p_search_energy
           node_type: PNode
-        - name: discover_energy_resource_goal
+        # Energy recovery is safety-critical. This structural goal prevents a
+        # zero motivational activation from triggering MainLoop's random fallback.
+        - name: safe_operation_goal
           node_type: Goal
         - name: robotino_world
           node_type: WorldModel
@@ -226,7 +249,9 @@ LTM:
         neighbors:
         - name: p_return_energy
           node_type: PNode
-        - name: restore_energy_goal
+        # The recovery context itself guarantees priority; do not let a transient
+        # zero drive/goal activation make MainLoop choose a random policy.
+        - name: safe_operation_goal
           node_type: Goal
         - name: robotino_world
           node_type: WorldModel
@@ -258,6 +283,14 @@ LTM:
         service_name: /robotino/emdb/execute_policy
         neighbors:
         - name: c_explore
+          node_type: CNode
+    - name: wander_mapped_space
+      class_name: cognitive_nodes.policy.PolicyBlocking
+      parameters:
+        service_msg: cognitive_node_interfaces.srv.Policy
+        service_name: /robotino/emdb/execute_policy
+        neighbors:
+        - name: c_wander
           node_type: CNode
     - name: search_for_energy
       class_name: cognitive_nodes.policy.PolicyBlocking

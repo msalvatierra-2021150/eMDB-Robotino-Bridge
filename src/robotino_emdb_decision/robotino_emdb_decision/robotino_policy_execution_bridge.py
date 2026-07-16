@@ -27,6 +27,7 @@ from cognitive_node_interfaces.srv import Policy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from std_msgs.msg import Bool, Float32
 
 from robotino_emdb_interfaces.msg import (
     RobotinoForagingState,
@@ -75,7 +76,17 @@ class RobotinoPolicyExecutionBridge(Node):
             "outcome_topic",
             "/robotino/emdb/policy_outcome",
         )
+        self.declare_parameter(
+            "mapping_complete_topic",
+            "/frontier_exploration/mapping_complete",
+        )
+        self.declare_parameter(
+            "exploration_satisfaction_topic",
+            "/robotino/emdb/satisfaction/exploration",
+        )
         self.declare_parameter("execution_timeout_s", 120.0)
+        self.declare_parameter("low_energy_threshold", 0.35)
+        self.declare_parameter("resume_energy_threshold", 0.70)
         self.declare_parameter("minimum_energy_bank_score", 0.0)
         self.declare_parameter("minimum_energy_bank_worthiness", 0.10)
         self.declare_parameter("wait_safe_duration_s", 1.0)
@@ -87,9 +98,29 @@ class RobotinoPolicyExecutionBridge(Node):
             self.get_parameter("selected_policy_topic").value
         )
         self.outcome_topic = str(self.get_parameter("outcome_topic").value)
+        self.mapping_complete_topic = str(
+            self.get_parameter("mapping_complete_topic").value
+        )
+        self.exploration_satisfaction_topic = str(
+            self.get_parameter("exploration_satisfaction_topic").value
+        )
         self.execution_timeout_s = max(
             1.0,
             float(self.get_parameter("execution_timeout_s").value),
+        )
+        self.low_energy_threshold = max(
+            0.0,
+            min(
+                1.0,
+                float(self.get_parameter("low_energy_threshold").value),
+            ),
+        )
+        self.resume_energy_threshold = max(
+            self.low_energy_threshold,
+            min(
+                1.0,
+                float(self.get_parameter("resume_energy_threshold").value),
+            ),
         )
         self.minimum_energy_bank_score = max(
             0.0,
@@ -122,6 +153,10 @@ class RobotinoPolicyExecutionBridge(Node):
         self.callback_group = ReentrantCallbackGroup()
 
         self.latest_foraging_state: Optional[RobotinoForagingState] = None
+        self.energy_recovery_mode = False
+        self.energy_mode_initialized = False
+        self.mapping_complete = False
+        self.mapping_complete_signal_received = False
         self.pending: Optional[PendingExecution] = None
         self.pending_lock = threading.Lock()
 
@@ -144,6 +179,20 @@ class RobotinoPolicyExecutionBridge(Node):
             10,
             callback_group=self.callback_group,
         )
+        self.mapping_complete_subscription = self.create_subscription(
+            Bool,
+            self.mapping_complete_topic,
+            self.mapping_complete_callback,
+            10,
+            callback_group=self.callback_group,
+        )
+        self.exploration_satisfaction_subscription = self.create_subscription(
+            Float32,
+            self.exploration_satisfaction_topic,
+            self.exploration_satisfaction_callback,
+            10,
+            callback_group=self.callback_group,
+        )
         self.policy_service = self.create_service(
             Policy,
             self.service_name,
@@ -155,12 +204,66 @@ class RobotinoPolicyExecutionBridge(Node):
             "Robotino GII policy bridge ready: "
             f"service={self.service_name}, "
             f"command_topic={self.selected_policy_topic}, "
-            f"outcome_topic={self.outcome_topic}"
+            f"outcome_topic={self.outcome_topic}, "
+            f"mapping_complete_topic={self.mapping_complete_topic}, "
+            f"exploration_satisfaction_topic="
+            f"{self.exploration_satisfaction_topic}, "
+            f"energy_hysteresis={self.low_energy_threshold:.2f}/"
+            f"{self.resume_energy_threshold:.2f}"
         )
 
+    def update_mapping_complete(self, value: bool, source: str) -> None:
+        value = bool(value)
+        if value != self.mapping_complete:
+            self.get_logger().info(
+                f"Policy bridge mapping_complete changed to {value} "
+                f"from {source}."
+            )
+        self.mapping_complete = value
+
+    def mapping_complete_callback(self, msg: Bool) -> None:
+        """Use the frontier completion topic as the direct authority."""
+        self.mapping_complete_signal_received = True
+        self.update_mapping_complete(bool(msg.data), "mapping_complete topic")
+
+    def exploration_satisfaction_callback(self, msg: Float32) -> None:
+        """Use recurrent exploration satisfaction until the Bool topic arrives."""
+        if self.mapping_complete_signal_received:
+            return
+        self.update_mapping_complete(
+            float(msg.data) >= 0.999,
+            "exploration satisfaction fallback",
+        )
+
+    def update_energy_recovery_mode(self, energy: float) -> None:
+        """Mirror context-perception hysteresis for dispatch-time safety."""
+        energy = max(0.0, min(1.0, float(energy)))
+        if not self.energy_mode_initialized:
+            self.energy_recovery_mode = energy <= self.low_energy_threshold
+            self.energy_mode_initialized = True
+            return
+
+        if (
+            not self.energy_recovery_mode
+            and energy <= self.low_energy_threshold
+        ):
+            self.energy_recovery_mode = True
+            self.get_logger().info(
+                f"Policy bridge entered energy recovery at energy={energy:.3f}."
+            )
+        elif (
+            self.energy_recovery_mode
+            and energy >= self.resume_energy_threshold
+        ):
+            self.energy_recovery_mode = False
+            self.get_logger().info(
+                f"Policy bridge left energy recovery at energy={energy:.3f}."
+            )
+
     def foraging_callback(self, msg: RobotinoForagingState) -> None:
-        """Store the latest factual Robotino state used to resolve targets."""
+        """Store state and synchronize dispatch-time energy priority."""
         self.latest_foraging_state = msg
+        self.update_energy_recovery_mode(float(msg.robot_energy))
 
     def execute_policy_callback(
         self,
@@ -248,6 +351,9 @@ class RobotinoPolicyExecutionBridge(Node):
                 "continue_exploring",
                 "search_for_energy",
             }
+            # Frontier policies complete immediately. Mapped wandering is
+            # already a real blocking Nav2 action and needs no artificial wait.
+            and not bool(command.use_nav2)
             and self.minimum_exploration_cycle_s > 0.0
         ):
             elapsed = time.monotonic() - dispatch_started
@@ -317,24 +423,64 @@ class RobotinoPolicyExecutionBridge(Node):
             )
             return None
 
-        if policy_name == "continue_exploring":
+        # MainLoop selects from a perception snapshot. By the time a blocking
+        # policy request reaches this bridge, that snapshot can be stale. Guard
+        # the actual command with the same energy hysteresis used by context
+        # perception so novelty/goal motion can never outrank energy recovery.
+        if policy_name in {
+            "continue_exploring",
+            "wander_mapped_space",
+            "go_to_goal",
+        } and self.energy_recovery_mode:
+            self.get_logger().warn(
+                f"Rejected stale '{policy_name}' during energy recovery "
+                f"(energy={float(state.robot_energy):.3f})."
+            )
+            return None
+
+        if policy_name in {"search_for_energy", "return_to_energy"} and (
+            not self.energy_recovery_mode
+        ):
+            self.get_logger().warn(
+                f"Rejected stale '{policy_name}' because energy recovery is "
+                f"inactive (energy={float(state.robot_energy):.3f})."
+            )
+            return None
+
+        if policy_name in {"continue_exploring", "wander_mapped_space"}:
+            is_wander = policy_name == "wander_mapped_space"
             command.policy_id = self.POLICY_CONTINUE_EXPLORING
-            command.policy_name = "continue_exploring"
+            command.policy_name = policy_name
             command.drive_id = 1
             command.drive_name = "novelty"
-            command.goal_name = "increase_environment_knowledge"
-            command.use_nav2 = False
-            command.interrupt_exploration = False
+            command.goal_name = (
+                "gather_semantic_experience"
+                if is_wander
+                else "increase_environment_knowledge"
+            )
+            # Frontier exploration is owned by the existing frontier process.
+            # Mapped wandering is one concrete blocking Nav2 action owned by the
+            # Robotino executor after the frontier process reports completion.
+            command.use_nav2 = is_wander
+            command.interrupt_exploration = is_wander
             return command
 
         if policy_name == "search_for_energy":
+            mapped_search = bool(self.mapping_complete)
             command.policy_id = self.POLICY_SEARCH_FOR_ENERGY
             command.policy_name = "search_for_energy"
             command.drive_id = 2
             command.drive_name = "energy"
-            command.goal_name = "discover_energy_resource"
-            command.use_nav2 = False
-            command.interrupt_exploration = False
+            command.goal_name = (
+                "search_mapped_space_for_energy"
+                if mapped_search
+                else "discover_energy_resource"
+            )
+            # Before mapping completion the existing frontier process searches.
+            # Afterwards the Robotino executor owns one blocking mapped-space
+            # wandering action, preserving the same abstract eMDB policy.
+            command.use_nav2 = mapped_search
+            command.interrupt_exploration = mapped_search
             return command
 
         if policy_name == "inspect_visible_tag":
@@ -504,6 +650,8 @@ class RobotinoPolicyExecutionBridge(Node):
         aliases = {
             "explore_frontier": "continue_exploring",
             "continue_exploring": "continue_exploring",
+            "wander": "wander_mapped_space",
+            "wander_mapped_space": "wander_mapped_space",
             "search_for_energy": "search_for_energy",
             "inspect_visible_tag": "inspect_visible_tag",
             "return_to_best_energy_bank": "return_to_energy",

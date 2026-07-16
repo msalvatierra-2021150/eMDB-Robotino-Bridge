@@ -168,6 +168,7 @@ class NavigationPlanningMixin:
             "generation": generation,
             "policy": copy.deepcopy(policy),
             "stage": self.STAGE_PLANNING,
+            "navigation_mode": "tag",
             "target_x": target_x,
             "target_y": target_y,
             "energy_before": self.get_current_energy(),
@@ -364,29 +365,56 @@ class NavigationPlanningMixin:
             return
 
         self.active_path_goal_handle = None
+        mode = str(context.get("navigation_mode", "tag"))
+        valid_candidates = [
+            candidate
+            for candidate in self.candidate_plan_candidates
+            if bool(candidate.get("valid", False))
+        ]
 
-        candidate = self.candidate_plan_candidates[0]
-
-        if not candidate["valid"]:
-            self.get_logger().error(
-                "The observation-side tag approach is not reachable."
+        if not valid_candidates:
+            description = (
+                "mapped-space wandering candidates"
+                if mode == "wander"
+                else "observation-side tag approach"
             )
+            self.get_logger().error(f"No reachable {description} found.")
             self.finish_execution(
                 generation,
                 success=False,
                 failure_reason=constants.FAILURE_TARGET_UNREACHABLE,
-                resume_exploration=self.resume_exploration_after_failure,
+                resume_exploration=(
+                    False
+                    if mode == "wander"
+                    else self.resume_exploration_after_failure
+                ),
                 navigation_result=RobotinoPolicyOutcome.NAV_FAILED,
             )
             return
 
-        context["selected_candidate_name"] = "observation_side"
+        if mode == "wander":
+            # Preserve novelty while mildly penalizing unnecessarily long paths.
+            candidate = max(
+                valid_candidates,
+                key=lambda item: (
+                    float(item.get("wander_score", 0.0))
+                    - 0.10 * float(item["path_length"])
+                ),
+            )
+            context["target_x"] = float(candidate["x"])
+            context["target_y"] = float(candidate["y"])
+            self.register_selected_wander_candidate(candidate)
+        else:
+            candidate = min(
+                valid_candidates,
+                key=lambda item: float(item["path_length"]),
+            )
 
+        context["selected_candidate_name"] = str(candidate["name"])
         self.get_logger().info(
-            "Selected observation-side approach: "
+            f"Selected {mode} candidate '{candidate['name']}': "
             f"goal=({candidate['x']:.3f}, {candidate['y']:.3f}, "
             f"yaw={candidate['yaw']:.3f}), "
             f"path_length={candidate['path_length']:.3f} m."
         )
-
         self.send_navigation_goal(generation, candidate)

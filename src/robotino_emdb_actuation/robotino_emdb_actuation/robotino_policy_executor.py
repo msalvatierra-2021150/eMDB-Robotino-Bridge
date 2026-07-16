@@ -29,14 +29,17 @@ onto RobotinoPolicyExecutor below so they share a single `self`:
 * outcome_publishing    - RobotinoPolicyOutcome publishing and simple I/O
 """
 
+from collections import deque
+import random
 from typing import Any, Dict, List, Optional
 
 import rclpy
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import PoseStamped, Twist
+from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from nav2_msgs.action import ComputePathToPose, NavigateToPose
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Float32
 from tf2_ros import Buffer, TransformListener
 
 from robotino_emdb_interfaces.msg import (
@@ -48,6 +51,7 @@ from robotino_emdb_interfaces.msg import (
 from .execution_lifecycle import ExecutionLifecycleMixin
 from .geometry_helpers import GeometryHelpersMixin
 from .interaction_waiting import InteractionWaitingMixin
+from .mapped_wandering import MappedWanderingMixin
 from .navigation_execution import NavigationExecutionMixin
 from .navigation_planning import NavigationPlanningMixin
 from .outcome_publishing import OutcomePublishingMixin
@@ -59,6 +63,7 @@ MIN_DISTANCE_EPSILON_M = 0.001
 class RobotinoPolicyExecutor(
     Node,
     PolicyDispatchMixin,
+    MappedWanderingMixin,
     NavigationPlanningMixin,
     NavigationExecutionMixin,
     InteractionWaitingMixin,
@@ -114,6 +119,39 @@ class RobotinoPolicyExecutor(
         self.declare_parameter("resume_exploration_after_energy", True)
         self.declare_parameter("resume_exploration_after_failure", True)
 
+        # Post-mapping wandering uses the existing map, ComputePathToPose, and
+        # NavigateToPose clients owned by this executor.
+        self.declare_parameter(
+            "mapping_complete_topic",
+            "/frontier_exploration/mapping_complete",
+        )
+        self.declare_parameter("map_topic", "/map")
+        self.declare_parameter(
+            "exploration_satisfaction_topic",
+            "/robotino/emdb/satisfaction/exploration",
+        )
+        self.declare_parameter("wander_energy_threshold", 0.35)
+        self.declare_parameter("resume_energy_threshold", 0.70)
+        self.declare_parameter("minimum_energy_bank_score", 0.0)
+        self.declare_parameter("minimum_energy_bank_worthiness", 0.10)
+        self.declare_parameter("wander_min_distance_m", 1.25)
+        self.declare_parameter("wander_max_distance_m", 5.0)
+        self.declare_parameter("wander_clearance_m", 0.40)
+        self.declare_parameter("wander_free_threshold", 10)
+        self.declare_parameter("wander_candidate_samples", 300)
+        self.declare_parameter("wander_path_checks", 12)
+        self.declare_parameter("wander_recent_goal_count", 20)
+        self.declare_parameter("wander_recent_goal_radius_m", 1.0)
+        self.declare_parameter("wander_random_seed", 0)
+        self.declare_parameter(
+            "wandering_active_topic",
+            "/robotino/emdb/wandering_active",
+        )
+        self.declare_parameter(
+            "wander_goal_topic",
+            "/robotino/emdb/wander_goal",
+        )
+
         self.robot_base_frame = str(
             self.get_parameter("robot_base_frame").value
         )
@@ -155,12 +193,99 @@ class RobotinoPolicyExecutor(
             self.get_parameter("resume_exploration_after_failure").value
         )
 
+        self.mapping_complete_topic = str(
+            self.get_parameter("mapping_complete_topic").value
+        )
+        self.map_topic = str(self.get_parameter("map_topic").value)
+        self.exploration_satisfaction_topic = str(
+            self.get_parameter("exploration_satisfaction_topic").value
+        )
+        self.wander_energy_threshold = max(
+            0.0,
+            min(
+                1.0,
+                float(self.get_parameter("wander_energy_threshold").value),
+            ),
+        )
+        self.resume_energy_threshold = max(
+            self.wander_energy_threshold,
+            min(
+                1.0,
+                float(self.get_parameter("resume_energy_threshold").value),
+            ),
+        )
+        self.minimum_energy_bank_score = max(
+            0.0,
+            float(self.get_parameter("minimum_energy_bank_score").value),
+        )
+        self.minimum_energy_bank_worthiness = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    self.get_parameter(
+                        "minimum_energy_bank_worthiness"
+                    ).value
+                ),
+            ),
+        )
+        self.wander_min_distance_m = max(
+            0.0,
+            float(self.get_parameter("wander_min_distance_m").value),
+        )
+        self.wander_max_distance_m = max(
+            self.wander_min_distance_m + 0.10,
+            float(self.get_parameter("wander_max_distance_m").value),
+        )
+        self.wander_clearance_m = max(
+            0.0,
+            float(self.get_parameter("wander_clearance_m").value),
+        )
+        self.wander_free_threshold = int(
+            self.get_parameter("wander_free_threshold").value
+        )
+        self.wander_candidate_samples = max(
+            1,
+            int(self.get_parameter("wander_candidate_samples").value),
+        )
+        self.wander_path_checks = max(
+            1,
+            int(self.get_parameter("wander_path_checks").value),
+        )
+        wander_recent_goal_count = max(
+            1,
+            int(self.get_parameter("wander_recent_goal_count").value),
+        )
+        self.wander_recent_goal_radius_m = max(
+            0.0,
+            float(self.get_parameter("wander_recent_goal_radius_m").value),
+        )
+        wander_random_seed = int(
+            self.get_parameter("wander_random_seed").value
+        )
+        self.wandering_active_topic = str(
+            self.get_parameter("wandering_active_topic").value
+        )
+        self.wander_goal_topic = str(
+            self.get_parameter("wander_goal_topic").value
+        )
+
         self.map_frame = self.MAP_FRAME
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.latest_foraging_state: Optional[RobotinoForagingState] = None
+        self.energy_recovery_mode = False
+        self.energy_mode_initialized = False
+        self.frontier_exploration_enabled = False
+        self.frontier_exploration_mode: Optional[str] = None
+        self.latest_map: Optional[OccupancyGrid] = None
+        self.mapping_complete = False
+        self.mapping_complete_signal_received = False
+        self.wandering_active = False
+        self.wander_random = random.Random(wander_random_seed)
+        self.recent_wander_goals = deque(maxlen=wander_recent_goal_count)
         self.last_goal_time = None
 
         # A single generation protects ComputePathToPose and NavigateToPose
@@ -190,6 +315,16 @@ class RobotinoPolicyExecutor(
             self.CMD_VEL_TOPIC,
             10,
         )
+        self.wandering_active_publisher = self.create_publisher(
+            Bool,
+            self.wandering_active_topic,
+            10,
+        )
+        self.wander_goal_publisher = self.create_publisher(
+            PoseStamped,
+            self.wander_goal_topic,
+            10,
+        )
 
         self.policy_subscriber = self.create_subscription(
             RobotinoSelectedPolicy,
@@ -201,6 +336,24 @@ class RobotinoPolicyExecutor(
             RobotinoForagingState,
             self.FORAGING_TOPIC,
             self.foraging_callback,
+            10,
+        )
+        self.mapping_complete_subscriber = self.create_subscription(
+            Bool,
+            self.mapping_complete_topic,
+            self.mapping_complete_callback,
+            10,
+        )
+        self.map_subscriber = self.create_subscription(
+            OccupancyGrid,
+            self.map_topic,
+            self.map_callback,
+            10,
+        )
+        self.exploration_satisfaction_subscriber = self.create_subscription(
+            Float32,
+            self.exploration_satisfaction_topic,
+            self.exploration_satisfaction_callback,
             10,
         )
 
@@ -220,10 +373,17 @@ class RobotinoPolicyExecutor(
             self.interaction_timer_callback,
         )
 
+        self.set_wandering_active(False, force=True)
+        self.set_exploration_enabled(False, force=True)
         self.get_logger().info(
             "Robotino policy executor ready. "
             f"Nav2 execution={'enabled' if self.enable_nav2_execution else 'disabled'}; "
-            "visible-tag inspection is memory-only."
+            "visible-tag inspection is memory-only; "
+            f"mapped wandering waits for {self.mapping_complete_topic}=true; "
+            f"novelty wandering requires energy>{self.wander_energy_threshold:.2f}; "
+            "search_for_energy ignores that lower threshold and runs until "
+            f"energy>={self.resume_energy_threshold:.2f} or a worthy bank is known; "
+            "frontier motion is guarded by the same energy hysteresis."
         )
 
 
@@ -240,6 +400,7 @@ def main(args=None) -> None:
             reason="node_shutdown",
             publish_outcome=False,
         )
+        node.set_wandering_active(False, force=True)
         node.stop_robot()
         node.destroy_node()
         rclpy.shutdown()

@@ -33,6 +33,7 @@ class RobotinoSeededPNode(PNode):
 
     SUPPORTED_CONTEXTS = {
         "explore",
+        "wander",
         "search_energy",
         "return_energy",
         "go_goal",
@@ -87,11 +88,20 @@ class RobotinoSeededPNode(PNode):
             and frontiers
             and not goal_satisfied
         )
+        wander = (
+            valid
+            and not recovery
+            and mapping_complete
+            and not goal_known
+            and not goal_satisfied
+        )
+        # Energy search remains active even after geometric mapping is complete.
+        # The bridge/executor choose frontier exploration while frontiers exist
+        # and mapped-space wandering after mapping_complete becomes true.
         search_energy = (
             valid
             and recovery
             and not bank_worthy
-            and frontiers
             and not goal_satisfied
         )
         return_energy = (
@@ -108,11 +118,12 @@ class RobotinoSeededPNode(PNode):
             and not goal_satisfied
         )
         wait_safe = not (
-            explore or search_energy or return_energy or go_goal
+            explore or wander or search_energy or return_energy or go_goal
         )
 
         values = {
             "explore": explore,
+            "wander": wander,
             "search_energy": search_energy,
             "return_energy": return_energy,
             "go_goal": go_goal,
@@ -270,7 +281,11 @@ class RobotinoStaticWorldModel(CognitiveNode):
 
 
 class RobotinoSafetyGoal(Goal):
-    """Always available, zero-reward Goal used only by wait_safe."""
+    """Always-available zero-reward structural Goal.
+
+    It anchors behaviors such as ``wait_safe`` and post-mapping wandering that
+    need a valid Goal neighbor without claiming task or motivational reward.
+    """
 
     def __init__(
         self,
@@ -296,7 +311,7 @@ class RobotinoSafetyGoal(Goal):
     def get_reward_callback(self, request, response):
         """Return a fresh zero reward without entering the base retry loop.
 
-        ``safe_operation_goal`` is a structural fallback goal, not a learned
+        ``safe_operation_goal`` is a structural behavior anchor, not a learned
         objective.  The stock Goal callback derives ``updated`` from message
         timestamps.  During MainLoop startup that response can arrive as stale
         or fail to reach the temporary service client, leaving

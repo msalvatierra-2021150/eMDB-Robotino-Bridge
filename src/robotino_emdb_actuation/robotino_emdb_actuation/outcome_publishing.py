@@ -211,14 +211,64 @@ class OutcomePublishingMixin:
             return 0.0
         return float(self.latest_foraging_state.total_reward)
 
-    def set_exploration_enabled(self, enabled: bool) -> None:
+    def set_exploration_enabled(
+        self,
+        enabled: bool,
+        mode: Optional[str] = None,
+        force: bool = False,
+    ) -> None:
+        """Publish and remember ownership of persistent frontier motion."""
+        enabled = bool(enabled)
+        resolved_mode = None
+        if enabled:
+            resolved_mode = str(
+                mode
+                or self.frontier_exploration_mode
+                or self.EXPLORATION_MODE_NOVELTY
+            )
+
+        changed = (
+            enabled != self.frontier_exploration_enabled
+            or resolved_mode != self.frontier_exploration_mode
+        )
+        self.frontier_exploration_enabled = enabled
+        self.frontier_exploration_mode = resolved_mode
+
+        if not changed and not force:
+            return
+
         msg = Bool()
-        msg.data = bool(enabled)
+        msg.data = enabled
         self.exploration_enable_publisher.publish(msg)
+
+    def resume_frontier_exploration_if_allowed(self) -> bool:
+        """Resume only adequate-energy, pre-mapping novelty exploration."""
+        state = self.latest_foraging_state
+        if self.frontier_exploration_allowed(
+            self.EXPLORATION_MODE_NOVELTY,
+            state,
+        ):
+            self.set_exploration_enabled(
+                True,
+                mode=self.EXPLORATION_MODE_NOVELTY,
+            )
+            self.get_logger().info(
+                "Frontier exploration safely resumed after policy completion."
+            )
+            return True
+
+        self.set_exploration_enabled(False)
+        self.get_logger().info(
+            "Frontier exploration was not resumed because energy recovery, "
+            "mapping completion, or mission completion has priority."
+        )
+        return False
 
     def stop_robot(self) -> None:
         self.cmd_vel_publisher.publish(Twist())
 
     def resume_after_failed_execution_if_configured(self) -> None:
         if self.resume_exploration_after_failure:
-            self.set_exploration_enabled(True)
+            self.resume_frontier_exploration_if_allowed()
+        else:
+            self.set_exploration_enabled(False)

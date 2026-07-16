@@ -37,6 +37,7 @@ class ExecutionLifecycleMixin:
             return
 
         policy = context["policy"]
+        was_wandering = context.get("navigation_mode") == "wander"
         energy_before = float(context["energy_before"])
         target_type = self.target_type_for_policy(policy)
         target_id = int(policy.target_tag_id)
@@ -48,6 +49,8 @@ class ExecutionLifecycleMixin:
         self.active_navigation_goal_handle = None
         self.candidate_plan_candidates = []
         self.candidate_plan_index = 0
+        if was_wandering:
+            self.set_wandering_active(False)
 
         self.publish_policy_outcome(
             policy=policy,
@@ -66,10 +69,9 @@ class ExecutionLifecycleMixin:
         )
 
         if resume_exploration:
-            self.set_exploration_enabled(True)
-            self.get_logger().info(
-                "Exploration re-enabled after policy completion."
-            )
+            self.resume_frontier_exploration_if_allowed()
+        else:
+            self.set_exploration_enabled(False)
 
     def cancel_current_execution(
         self,
@@ -77,6 +79,10 @@ class ExecutionLifecycleMixin:
         publish_outcome: bool,
     ) -> None:
         old_context = self.execution
+        was_wandering = (
+            old_context is not None
+            and old_context.get("navigation_mode") == "wander"
+        )
 
         # Invalidate all in-flight callbacks first.
         self.execution_generation += 1
@@ -102,6 +108,8 @@ class ExecutionLifecycleMixin:
 
         self.candidate_plan_candidates = []
         self.candidate_plan_index = 0
+        if was_wandering:
+            self.set_wandering_active(False)
 
         if old_context is None:
             return
