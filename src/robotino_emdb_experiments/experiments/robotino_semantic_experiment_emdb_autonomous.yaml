@@ -151,7 +151,7 @@ LTM:
       parameters:
         context: explore
         context_sensor: robotino_context
-        space_class: cognitive_nodes.space.PointBasedSpace
+        space_class: cognitive_nodes.space.ClosestPointBasedSpace
         neighbors:
         - name: robotino_context
           node_type: Perception
@@ -160,7 +160,7 @@ LTM:
       parameters:
         context: wander
         context_sensor: robotino_context
-        space_class: cognitive_nodes.space.PointBasedSpace
+        space_class: cognitive_nodes.space.ClosestPointBasedSpace
         neighbors:
         - name: robotino_context
           node_type: Perception
@@ -169,7 +169,7 @@ LTM:
       parameters:
         context: search_energy
         context_sensor: robotino_context
-        space_class: cognitive_nodes.space.PointBasedSpace
+        space_class: cognitive_nodes.space.ClosestPointBasedSpace
         neighbors:
         - name: robotino_context
           node_type: Perception
@@ -178,7 +178,7 @@ LTM:
       parameters:
         context: return_energy
         context_sensor: robotino_context
-        space_class: cognitive_nodes.space.PointBasedSpace
+        space_class: cognitive_nodes.space.ClosestPointBasedSpace
         neighbors:
         - name: robotino_context
           node_type: Perception
@@ -187,7 +187,7 @@ LTM:
       parameters:
         context: go_goal
         context_sensor: robotino_context
-        space_class: cognitive_nodes.space.PointBasedSpace
+        space_class: cognitive_nodes.space.ClosestPointBasedSpace
         neighbors:
         - name: robotino_context
           node_type: Perception
@@ -196,7 +196,7 @@ LTM:
       parameters:
         context: wait_safe
         context_sensor: robotino_context
-        space_class: cognitive_nodes.space.PointBasedSpace
+        space_class: cognitive_nodes.space.ClosestPointBasedSpace
         neighbors:
         - name: robotino_context
           node_type: Perception
@@ -326,13 +326,13 @@ LTM:
           node_type: CNode
   Connectors:
   - data: Space
-    default_class: cognitive_nodes.space.PointBasedSpace
+    default_class: cognitive_nodes.space.ClosestPointBasedSpace
   - data: Perception
     default_class: cognitive_nodes.perception.Perception
   - data: PNode
     default_class: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoSeededPNode
     parameters:
-      space_class: cognitive_nodes.space.PointBasedSpace
+      space_class: cognitive_nodes.space.ClosestPointBasedSpace
   - data: CNode
     default_class: robotino_emdb_decision.robotino_cognitive_nodes.RobotinoCNode
   - data: Goal

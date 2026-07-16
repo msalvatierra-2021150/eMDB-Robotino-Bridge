@@ -40,3 +40,6 @@ opt/robotino/
 # Temporary files
 tmp/
 temp/
+
+# Text
+*.txt

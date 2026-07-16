@@ -14,6 +14,7 @@ import rclpy
 from cognitive_nodes.cnode import CNode
 from cognitive_nodes.goal import Goal
 from cognitive_nodes.pnode import PNode
+from cognitive_nodes.space import ClosestPointBasedSpace, PointBasedSpace
 from cognitive_node_interfaces.msg import Activation
 from cognitive_node_interfaces.srv import GetActivation
 from core.cognitive_node import CognitiveNode
@@ -46,7 +47,7 @@ class RobotinoSeededPNode(PNode):
         class_name: str = "cognitive_nodes.pnode.PNode",
         context: str = "",
         context_sensor: str = "robotino_context",
-        space_class: str = "cognitive_nodes.space.PointBasedSpace",
+        space_class: str = "cognitive_nodes.space.ClosestPointBasedSpace",
         history_size: int = 100,
         **params,
     ) -> None:
@@ -63,6 +64,19 @@ class RobotinoSeededPNode(PNode):
             raise ValueError(
                 f"Unsupported Robotino P-Node context: {self.seed_context}"
             )
+
+        # PointBasedSpace is only a storage base class: its get_probability()
+        # deliberately raises NotImplementedError. MainLoop-created P-Nodes have
+        # no seed context and therefore use the learned-space activation path.
+        # Replace an abstract/misconfigured space with the simplest concrete
+        # deterministic implementation instead of crashing the executor.
+        current_space = self.spaces[0]
+        if current_space.__class__.get_probability is PointBasedSpace.get_probability:
+            self.get_logger().warning(
+                f"P-Node '{name}' received abstract PointBasedSpace; "
+                "using ClosestPointBasedSpace instead."
+            )
+            self.spaces[0] = ClosestPointBasedSpace(ident=name + " space")
         self.get_logger().info(
             f"Robotino P-Node '{name}' initialized with context="
             f"{self.seed_context or '<learned>'}"
