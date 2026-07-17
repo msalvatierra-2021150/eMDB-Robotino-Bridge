@@ -6,7 +6,6 @@ execution, so late Nav2/ComputePathToPose results cannot be attributed to a
 newer policy.
 """
 
-import math
 from typing import Any, Dict, Optional
 
 from geometry_msgs.msg import PoseStamped
@@ -174,24 +173,40 @@ class ExecutionLifecycleMixin:
         self,
         policy: RobotinoSelectedPolicy,
     ) -> bool:
+        """Return whether an incoming command matches the active execution.
+
+        Tag coordinates can move by several centimeters as AprilTag perception
+        and memory estimates are updated. Once navigation toward a semantic tag
+        is active, coordinate jitter must not cancel and restart the Nav2 goal.
+
+        For tag-navigation policies, identity is therefore the policy ID plus
+        target tag ID. For policies without a semantic tag target, matching the
+        policy ID is sufficient to suppress repeated publications while the
+        current execution remains active.
+        """
         if self.execution is None:
             return False
 
-        active_policy = self.execution["policy"]
-        return (
-            int(active_policy.policy_id) == int(policy.policy_id)
-            and int(active_policy.target_tag_id) == int(policy.target_tag_id)
-            and math.isclose(
-                float(active_policy.target_x_map),
-                float(policy.target_x_map),
-                abs_tol=0.02,
+        active_policy = self.execution.get("policy")
+        if active_policy is None:
+            return False
+
+        active_policy_id = int(active_policy.policy_id)
+        incoming_policy_id = int(policy.policy_id)
+        if active_policy_id != incoming_policy_id:
+            return False
+
+        tag_navigation_policies = {
+            self.POLICY_RETURN_TO_BEST_ENERGY_BANK,
+            self.POLICY_GOAL,
+        }
+        if incoming_policy_id in tag_navigation_policies:
+            return (
+                int(active_policy.target_tag_id)
+                == int(policy.target_tag_id)
             )
-            and math.isclose(
-                float(active_policy.target_y_map),
-                float(policy.target_y_map),
-                abs_tol=0.02,
-            )
-        )
+
+        return True
 
     def describe_active_execution(self) -> str:
         if self.execution is None:

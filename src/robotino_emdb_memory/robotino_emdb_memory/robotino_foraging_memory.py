@@ -8,8 +8,12 @@ This node stores concrete Robotino facts that the generic architecture cannot
 know by itself:
   * tag IDs and semantic types;
   * robust map positions and successful observation poses;
-  * remaining resource amounts;
+  * last-observed resource amounts;
   * per-tag evidence for presence, reachability and recharge reliability.
+
+The configured regeneration rate is used only by a private resource-world
+model. It is never stored in Robotino's learned tag memory or used directly
+to predict that a depleted resource has become available again.
 
 It publishes RobotinoForagingState. A custom official e-MDB Perception node
 normalizes that message and publishes /perception/foraging_state/value.
@@ -80,12 +84,15 @@ class RobotinoForagingMemory(Node):
 
         # Evidence weights for the three requested outcomes.
         self.declare_parameter("successful_recharge_weight", 2.0)
+        self.declare_parameter("failed_recharge_weight", 1.0)
         self.declare_parameter("navigation_failure_weight", 1.0)
         self.declare_parameter("verified_absence_weight", 1.0)
         self.declare_parameter("missing_confidence_threshold", 0.35)
         self.declare_parameter("unreachable_confidence_threshold", 0.35)
         self.declare_parameter("missing_after_consecutive_failures", 2)
         self.declare_parameter("unreachable_after_consecutive_failures", 2)
+        self.declare_parameter("depleted_verification_score_factor", 0.10)
+        self.declare_parameter("depleted_retry_delay_s", 60.0)
 
         # ------------------------------------------------------------------
         # Read parameters
@@ -115,6 +122,9 @@ class RobotinoForagingMemory(Node):
         self.successful_recharge_weight = float(
             self.get_parameter("successful_recharge_weight").value
         )
+        self.failed_recharge_weight = float(
+            self.get_parameter("failed_recharge_weight").value
+        )
         self.navigation_failure_weight = float(
             self.get_parameter("navigation_failure_weight").value
         )
@@ -133,6 +143,15 @@ class RobotinoForagingMemory(Node):
         self.unreachable_after_consecutive_failures = int(
             self.get_parameter("unreachable_after_consecutive_failures").value
         )
+        self.depleted_verification_score_factor = self.clamp(
+            self.get_parameter("depleted_verification_score_factor").value,
+            0.0,
+            1.0,
+        )
+        self.depleted_retry_delay_s = max(
+            0.0,
+            float(self.get_parameter("depleted_retry_delay_s").value),
+        )
 
         self.persist_memory = bool(
             self.get_parameter("persist_memory").value
@@ -149,6 +168,11 @@ class RobotinoForagingMemory(Node):
         )
         self.tag_semantics = self.load_tag_semantics(self.semantics_file)
         self.warned_unknown_tag_ids = set()
+
+        # Private environment truth. The regeneration rate remains available
+        # here for resource simulation, but is never copied into learned
+        # Robotino tag memory or published to e-MDB.
+        self.resource_truth = self.create_resource_truth()
 
         energy_tag_ids = sorted(
             tag_id
@@ -167,6 +191,7 @@ class RobotinoForagingMemory(Node):
         # Key: integer tag ID. Value: factual resource record.
         self.memory = {}
         self.load_resource_memory()
+        self.restore_resource_truth_from_memory()
 
         self.goal_satisfied = False
         self.last_logged_best_energy_tag_id = None
@@ -327,6 +352,33 @@ class RobotinoForagingMemory(Node):
         )
         return semantics
 
+    def create_resource_truth(self):
+        """Create private physical resource state from semantic YAML.
+
+        This state owns regeneration. It is intentionally separate from
+        ``self.memory`` so Robotino cannot infer availability from regen_rate.
+        """
+        resources = {}
+        for tag_id, semantics in self.tag_semantics.items():
+            if not bool(semantics.get("is_energy_bank", False)):
+                continue
+
+            capacity = max(0.0, float(semantics.get("capacity", 0.0)))
+            resources[int(tag_id)] = {
+                "capacity": capacity,
+                "remaining": capacity,
+                "collection_rate": max(
+                    0.0,
+                    float(semantics.get("collection_rate", 0.0)),
+                ),
+                "regen_rate": max(
+                    0.0,
+                    float(semantics.get("regen_rate", 0.0)),
+                ),
+                "last_update_time": 0.0,
+            }
+        return resources
+
     def default_evidence(self):
         return {
             # A tag enters memory because it was visually detected.
@@ -346,6 +398,8 @@ class RobotinoForagingMemory(Node):
             "recharge_successes": 0,
             "consecutive_navigation_failures": 0,
             "consecutive_not_found": 0,
+            "consecutive_recharge_failures": 0,
+            "last_recharge_attempt_time": 0.0,
             "status": "UNVERIFIED",
             "last_outcome": "none",
             "last_failure_reason": "none",
@@ -387,7 +441,8 @@ class RobotinoForagingMemory(Node):
         data["is_energy_bank"] = bool(semantics["is_energy_bank"])
         data["resource_capacity"] = float(semantics["capacity"])
         data["collection_rate"] = float(semantics["collection_rate"])
-        data["regen_rate"] = float(semantics["regen_rate"])
+        # Remove legacy privileged knowledge from persistent learned memory.
+        data.pop("regen_rate", None)
         data.setdefault("resource_remaining", float(semantics["capacity"]))
 
         # Clamp old persisted values to the current configured capacity.
@@ -430,8 +485,9 @@ class RobotinoForagingMemory(Node):
                 # and evidence, but restart transient time references.
                 record["last_seen_time"] = 0.0
                 record["last_detection_time"] = 0.0
-                record["last_resource_update_time"] = 0.0
+                record.pop("last_resource_update_time", None)
                 record.pop("last_collection_time", None)
+                record.pop("regen_rate", None)
                 self.memory[tag_id] = record
 
             self.get_logger().info(
@@ -441,6 +497,20 @@ class RobotinoForagingMemory(Node):
             self.get_logger().error(
                 f"Could not load Robotino resource memory: {error}"
             )
+
+    def restore_resource_truth_from_memory(self):
+        """Resume hidden resource amounts from the last observed values."""
+        for tag_id, data in self.memory.items():
+            resource = self.resource_truth.get(int(tag_id))
+            if resource is None:
+                continue
+            resource["remaining"] = self.clamp(
+                data.get("resource_remaining", resource["capacity"]),
+                0.0,
+                resource["capacity"],
+            )
+            resource["last_update_time"] = 0.0
+            resource.pop("last_collection_time", None)
 
     def save_resource_memory(self):
         if not self.persist_memory:
@@ -585,6 +655,7 @@ class RobotinoForagingMemory(Node):
 
         remembered["last_detection_time"] = now_sec
         self.update_resource_bank(tag_id, now_sec)
+        self.observe_resource_bank(tag_id)
         self.collect_energy_from_bank(tag_id, msg, now_sec)
 
         self.populate_visible_tag_state(
@@ -608,7 +679,6 @@ class RobotinoForagingMemory(Node):
             "first_seen_time": now_sec,
             "last_seen_time": now_sec,
             "last_detection_time": now_sec,
-            "last_resource_update_time": now_sec,
             "times_seen": 1,
             "position_samples": [(measurement_x, measurement_y)],
             "accepted_pose_samples": 1,
@@ -625,9 +695,10 @@ class RobotinoForagingMemory(Node):
             "best_observation_bearing": float(msg.bearing),
             "is_energy_bank": bool(semantics["is_energy_bank"]),
             "resource_capacity": float(semantics["capacity"]),
+            # This is the last amount Robotino has observed, not a
+            # time-predicted value derived from the regeneration rate.
             "resource_remaining": float(semantics["capacity"]),
             "collection_rate": float(semantics["collection_rate"]),
-            "regen_rate": float(semantics["regen_rate"]),
         }
         data.update(self.default_evidence())
         data["status"] = "ACTIVE"
@@ -804,8 +875,15 @@ class RobotinoForagingMemory(Node):
         data = self.ensure_memory_schema(self.memory[tag_id])
         data["last_failure_reason"] = msg.failure_reason or "none"
 
+        if msg.policy_completed and msg.recharge_attempted:
+            data["last_recharge_attempt_time"] = (
+                self.get_clock().now().nanoseconds / 1e9
+            )
+
         if self.is_complete_successful_recharge(msg):
             self.handle_successful_recharge(data)
+        elif self.is_complete_failed_recharge(msg):
+            self.handle_failed_recharge(data)
         elif msg.navigation_result == RobotinoPolicyOutcome.NAV_FAILED:
             self.handle_navigation_failure(data)
         elif (
@@ -836,6 +914,19 @@ class RobotinoForagingMemory(Node):
             and msg.energy_after > msg.energy_before
         )
 
+    @staticmethod
+    def is_complete_failed_recharge(msg):
+        """A reached resource produced no confirmed energy increase."""
+        return (
+            msg.policy_id
+            == RobotinoPolicyOutcome.POLICY_RETURN_TO_ENERGY
+            and msg.policy_completed
+            and msg.navigation_result
+            == RobotinoPolicyOutcome.NAV_SUCCEEDED
+            and msg.recharge_attempted
+            and not msg.recharge_succeeded
+        )
+
     def handle_successful_recharge(self, data):
         weight = self.successful_recharge_weight
         data["presence_positive"] += weight
@@ -849,9 +940,32 @@ class RobotinoForagingMemory(Node):
         data["recharge_successes"] += 1
         data["consecutive_navigation_failures"] = 0
         data["consecutive_not_found"] = 0
+        data["consecutive_recharge_failures"] = 0
         data["status"] = "ACTIVE"
         data["last_outcome"] = "SUCCESSFUL_RECHARGE"
         data["last_failure_reason"] = "none"
+
+    def handle_failed_recharge(self, data):
+        """Lower learned recharge reliability without questioning the tag.
+
+        Navigation succeeded and an interaction was attempted, so presence and
+        reachability remain supported. Only rechargability receives negative
+        evidence. The resource stays remembered as a low-priority future
+        verification candidate.
+        """
+        data["navigation_attempts"] += 1
+        data["navigation_successes"] += 1
+        data["verification_attempts"] += 1
+        data["recharge_attempts"] += 1
+        data["recharge_negative"] += self.failed_recharge_weight
+        # The latest interaction is stronger evidence than a stale previous
+        # observation that the resource was available.
+        data["resource_remaining"] = 0.0
+        data["consecutive_navigation_failures"] = 0
+        data["consecutive_not_found"] = 0
+        data["consecutive_recharge_failures"] += 1
+        data["status"] = "DEPLETED_OR_NOT_READY"
+        data["last_outcome"] = "RECHARGE_FAILED"
 
     def handle_navigation_failure(self, data):
         data["navigation_attempts"] += 1
@@ -925,9 +1039,12 @@ class RobotinoForagingMemory(Node):
         the tag coordinate.  Therefore ranking first uses the saved observation
         pose for travel cost and falls back to the tag pose only when needed.
 
+        An observed-available bank uses its last observed amount. A depleted
+        bank remains a low-priority verification candidate after a generic
+        cooldown; no regeneration rate is used in this ranking.
+
         A candidate is usable only when:
           * current semantics classify it as an energy bank;
-          * remaining resource is positive;
           * a finite target pose exists;
           * reliability and resulting score are finite and positive.
         """
@@ -952,6 +1069,7 @@ class RobotinoForagingMemory(Node):
             robot_y = 0.0
 
         candidate_summaries = []
+        now_sec = self.get_clock().now().nanoseconds / 1e9
 
         for tag_id, raw_data in self.memory.items():
             data = self.apply_current_semantics(tag_id, raw_data)
@@ -961,9 +1079,9 @@ class RobotinoForagingMemory(Node):
                 continue
 
             remaining = float(data.get("resource_remaining", 0.0))
-            if not math.isfinite(remaining) or remaining <= 0.0:
+            if not math.isfinite(remaining) or remaining < 0.0:
                 candidate_summaries.append(
-                    f"{tag_id}:empty({remaining!r})"
+                    f"{tag_id}:invalid_remaining({remaining!r})"
                 )
                 continue
 
@@ -991,7 +1109,43 @@ class RobotinoForagingMemory(Node):
                 continue
 
             distance = math.hypot(target_x - robot_x, target_y - robot_y)
-            foraging_score = remaining / (1.0 + distance)
+
+            if remaining > 0.0:
+                candidate_mode = "available"
+                scoring_resource = remaining
+                retry_factor = 1.0
+            else:
+                candidate_mode = "verify"
+                last_attempt = float(
+                    data.get("last_recharge_attempt_time", 0.0)
+                )
+                elapsed_since_attempt = (
+                    self.depleted_retry_delay_s
+                    if last_attempt <= 0.0
+                    else max(0.0, now_sec - last_attempt)
+                )
+                if self.depleted_retry_delay_s <= 0.0:
+                    retry_factor = 1.0
+                else:
+                    retry_factor = self.clamp(
+                        elapsed_since_attempt / self.depleted_retry_delay_s,
+                        0.0,
+                        1.0,
+                    )
+
+                scoring_resource = (
+                    float(data.get("resource_capacity", 0.0))
+                    * self.depleted_verification_score_factor
+                    * retry_factor
+                )
+                if scoring_resource <= 0.0:
+                    candidate_summaries.append(
+                        f"{tag_id}:verify_cooldown("
+                        f"retry={retry_factor:.3f})"
+                    )
+                    continue
+
+            foraging_score = scoring_resource / (1.0 + distance)
             presence = self.presence_confidence(data)
             reachability = self.reachability_confidence(data)
             recharge = self.recharge_reliability(data)
@@ -1014,8 +1168,10 @@ class RobotinoForagingMemory(Node):
                 continue
 
             candidate_summaries.append(
-                f"{tag_id}:ok(source={target_source},remaining={remaining:.3f},"
-                f"distance={distance:.3f},worthiness={memory_worthiness:.3f},"
+                f"{tag_id}:ok(mode={candidate_mode},source={target_source},"
+                f"observed_remaining={remaining:.3f},"
+                f"retry={retry_factor:.3f},distance={distance:.3f},"
+                f"worthiness={memory_worthiness:.3f},"
                 f"score={final_score:.4f})"
             )
 
@@ -1149,52 +1305,65 @@ class RobotinoForagingMemory(Node):
         return True
 
     def update_resource_bank(self, tag_id, now_sec):
-        if tag_id not in self.memory:
-            return
-        data = self.memory[tag_id]
-        if not data.get("is_energy_bank", False):
+        """Advance hidden physical resource state using the YAML rate."""
+        resource = self.resource_truth.get(int(tag_id))
+        if resource is None:
             return
 
-        last_time = float(data.get("last_resource_update_time", now_sec))
+        last_time = float(resource.get("last_update_time", now_sec))
         if last_time <= 0.0:
             last_time = now_sec
         dt = max(0.0, now_sec - last_time)
 
-        capacity = float(data["resource_capacity"])
-        remaining = float(data["resource_remaining"])
-        regen_rate = float(data["regen_rate"])
-
+        remaining = float(resource["remaining"])
+        regen_rate = float(resource["regen_rate"])
         if regen_rate > 0.0:
-            remaining = min(capacity, remaining + regen_rate * dt)
+            remaining = min(
+                float(resource["capacity"]),
+                remaining + regen_rate * dt,
+            )
 
-        data["resource_remaining"] = remaining
-        data["last_resource_update_time"] = now_sec
+        resource["remaining"] = remaining
+        resource["last_update_time"] = now_sec
+
+    def observe_resource_bank(self, tag_id):
+        """Copy only the currently observed amount into learned memory."""
+        if tag_id not in self.memory:
+            return
+        resource = self.resource_truth.get(int(tag_id))
+        if resource is None:
+            return
+        self.memory[tag_id]["resource_remaining"] = float(
+            resource["remaining"]
+        )
 
     def collect_energy_from_bank(self, tag_id, msg, now_sec):
         if tag_id not in self.memory:
             return 0.0
         data = self.memory[tag_id]
-        if not data.get("is_energy_bank", False):
+        resource = self.resource_truth.get(int(tag_id))
+        if resource is None or not data.get("is_energy_bank", False):
             return 0.0
         if msg.distance <= 0.05 or msg.distance > self.arrival_distance:
             return 0.0
 
-        remaining = float(data["resource_remaining"])
+        remaining = float(resource["remaining"])
         if remaining <= 0.0 or self.robot_energy >= 1.0:
+            data["resource_remaining"] = remaining
             return 0.0
 
-        last_time = float(data.get("last_collection_time", now_sec))
+        last_time = float(resource.get("last_collection_time", now_sec))
         dt = min(max(0.0, now_sec - last_time), 1.0)
-        collection_rate = float(data["collection_rate"])
-        amount_to_take = collection_rate * dt
+        amount_to_take = float(resource["collection_rate"]) * dt
         amount_taken = min(
             amount_to_take,
             remaining,
             1.0 - self.robot_energy,
         )
 
-        data["last_collection_time"] = now_sec
+        resource["last_collection_time"] = now_sec
         if amount_taken <= 0.0:
+            data["resource_remaining"] = remaining
             return 0.0
 
         self.robot_energy = self.clamp(
@@ -1202,7 +1371,8 @@ class RobotinoForagingMemory(Node):
             0.0,
             1.0,
         )
-        data["resource_remaining"] = remaining - amount_taken
+        resource["remaining"] = remaining - amount_taken
+        data["resource_remaining"] = float(resource["remaining"])
         return float(amount_taken)
 
     def destroy_node(self):

@@ -5,8 +5,9 @@ Behavioral contract
 * CONTINUE_EXPLORING and SEARCH_FOR_ENERGY enable exploration.
 * INSPECT_VISIBLE_TAG only acknowledges that perception/memory stored a tag.
   It never disables exploration, cancels navigation, or approaches the tag.
-* RETURN_TO_BEST_ENERGY_BANK approaches the remembered energy tag, then waits
-  for a real energy increase before reporting semantic success.
+* RETURN_TO_BEST_ENERGY_BANK approaches the remembered energy tag, confirms
+  that charging started, and remains active until the recovery threshold is
+  reached. Depletion or timeout before recovery is reported as failed evidence.
 * GOAL approaches the remembered goal tag, then waits for a real reward/goal
   confirmation before reporting semantic success.
 * Stale Nav2 callbacks are ignored with an execution-generation token, so a
@@ -48,6 +49,7 @@ from robotino_emdb_interfaces.msg import (
     RobotinoSelectedPolicy,
 )
 
+from . import constants
 from .execution_lifecycle import ExecutionLifecycleMixin
 from .geometry_helpers import GeometryHelpersMixin
 from .interaction_waiting import InteractionWaitingMixin
@@ -101,6 +103,7 @@ class RobotinoPolicyExecutor(
         self.declare_parameter("robot_base_frame", "base_link")
         self.declare_parameter("enable_nav2_execution", False)
         self.declare_parameter("minimum_goal_interval_s", 0.0)
+        self.declare_parameter("navigation_timeout_s", 45.0)
 
         # Tag approach geometry. These are center-of-base distances from the
         # tag/wall. Robotino radius is about 0.20 m; 0.65 m leaves room for
@@ -114,6 +117,8 @@ class RobotinoPolicyExecutor(
         self.declare_parameter("reward_success_delta", 0.01)
         self.declare_parameter("interaction_timeout_s", 12.0)
         self.declare_parameter("interaction_check_period_s", 0.20)
+        self.declare_parameter("energy_progress_delta", 0.001)
+        self.declare_parameter("resource_empty_epsilon", 0.01)
 
         # After charging, the requested behavior is to continue exploration.
         self.declare_parameter("resume_exploration_after_energy", True)
@@ -162,6 +167,10 @@ class RobotinoPolicyExecutor(
             0.0,
             float(self.get_parameter("minimum_goal_interval_s").value),
         )
+        self.navigation_timeout_s = max(
+            5.0,
+            float(self.get_parameter("navigation_timeout_s").value),
+        )
         self.energy_approach_standoff_m = max(
             MIN_DISTANCE_EPSILON_M,
             float(self.get_parameter("energy_approach_standoff_m").value),
@@ -185,6 +194,14 @@ class RobotinoPolicyExecutor(
         self.interaction_check_period_s = max(
             0.05,
             float(self.get_parameter("interaction_check_period_s").value),
+        )
+        self.energy_progress_delta = max(
+            1e-6,
+            float(self.get_parameter("energy_progress_delta").value),
+        )
+        self.resource_empty_epsilon = max(
+            0.0,
+            float(self.get_parameter("resource_empty_epsilon").value),
         )
         self.resume_exploration_after_energy = bool(
             self.get_parameter("resume_exploration_after_energy").value
@@ -383,8 +400,286 @@ class RobotinoPolicyExecutor(
             f"novelty wandering requires energy>{self.wander_energy_threshold:.2f}; "
             "search_for_energy ignores that lower threshold and runs until "
             f"energy>={self.resume_energy_threshold:.2f} or a worthy bank is known; "
-            "frontier motion is guarded by the same energy hysteresis."
+            "frontier motion is guarded by the same energy hysteresis; "
+            f"Nav2 watchdog={self.navigation_timeout_s:.1f}s; "
+            f"resource empty<={self.resource_empty_epsilon:.3f}."
         )
+
+
+    # ------------------------------------------------------------------
+    # Navigation and interaction watchdogs
+    # ------------------------------------------------------------------
+
+    def send_navigation_goal(
+        self,
+        generation: int,
+        selected: Dict[str, Any],
+    ) -> None:
+        """Attach a deadline before delegating goal execution to the mixin."""
+        context = self.get_execution(generation, self.STAGE_PLANNING)
+        if context is not None:
+            context["navigation_deadline_ns"] = (
+                self.get_clock().now().nanoseconds
+                + int(self.navigation_timeout_s * 1e9)
+            )
+
+        NavigationExecutionMixin.send_navigation_goal(
+            self,
+            generation,
+            selected,
+        )
+
+    def nav2_goal_response_callback(self, future, generation: int) -> None:
+        """Cancel a goal accepted after its execution was already invalidated."""
+        context = self.get_execution(generation, self.STAGE_NAVIGATING)
+        if context is None:
+            try:
+                stale_goal_handle = future.result()
+                if stale_goal_handle is not None and stale_goal_handle.accepted:
+                    stale_goal_handle.cancel_goal_async()
+                    self.get_logger().warn(
+                        "Canceled a stale Nav2 goal accepted after execution "
+                        f"generation {generation} had already finished."
+                    )
+            except Exception as ex:  # noqa: BLE001
+                self.get_logger().debug(
+                    f"Ignored stale Nav2 goal response for generation "
+                    f"{generation}: {ex}"
+                )
+            return
+
+        NavigationExecutionMixin.nav2_goal_response_callback(
+            self,
+            future,
+            generation,
+        )
+
+    def interaction_timer_callback(self) -> None:
+        """Watch both Nav2 execution and post-arrival semantic interaction."""
+        self.check_navigation_timeout()
+
+        context = self.get_waiting_context()
+        if context is None:
+            return
+
+        self.check_interaction_completion()
+
+        # Completion may have invalidated and cleared the execution.
+        context = self.get_waiting_context()
+        if context is None:
+            return
+
+        deadline_ns = context.get("interaction_deadline_ns")
+        if deadline_ns is None:
+            return
+
+        if self.get_clock().now().nanoseconds < int(deadline_ns):
+            return
+
+        policy_id = int(context["policy"].policy_id)
+        generation = int(context["generation"])
+
+        if policy_id == self.POLICY_RETURN_TO_BEST_ENERGY_BANK:
+            failure_reason = constants.FAILURE_RECHARGE_TIMEOUT
+            event_description = (
+                "energy_interaction_timeout_before_recovery_threshold"
+            )
+            recharge_attempted = True
+            recharge_succeeded = bool(context.get("recharge_detected", False))
+        elif policy_id == self.POLICY_GOAL:
+            failure_reason = constants.FAILURE_GOAL_NOT_CONFIRMED
+            event_description = "goal_interaction_timeout_no_reward_detected"
+            recharge_attempted = False
+            recharge_succeeded = False
+        else:
+            failure_reason = constants.FAILURE_OBSERVATION_TIMEOUT
+            event_description = "interaction_timeout"
+            recharge_attempted = False
+            recharge_succeeded = False
+
+        self.get_logger().warn(event_description)
+        self.finish_execution(
+            generation,
+            success=False,
+            failure_reason=failure_reason,
+            resume_exploration=self.resume_exploration_after_failure,
+            navigation_result=RobotinoPolicyOutcome.NAV_SUCCEEDED,
+            tag_result=RobotinoPolicyOutcome.TAG_CHECK_INCONCLUSIVE,
+            recharge_attempted=recharge_attempted,
+            recharge_succeeded=recharge_succeeded,
+        )
+
+    def check_navigation_timeout(self) -> None:
+        """Cancel a Nav2 goal that outlives the executor-owned deadline."""
+        context = self.execution
+        if context is None or context.get("stage") != self.STAGE_NAVIGATING:
+            return
+
+        deadline_ns = context.get("navigation_deadline_ns")
+        if deadline_ns is None:
+            # Compatibility for executions created before this field existed.
+            context["navigation_deadline_ns"] = (
+                self.get_clock().now().nanoseconds
+                + int(self.navigation_timeout_s * 1e9)
+            )
+            return
+
+        if self.get_clock().now().nanoseconds < int(deadline_ns):
+            return
+
+        generation = int(context["generation"])
+        navigation_mode = str(context.get("navigation_mode", "tag"))
+        resume_after_failure = (
+            False
+            if navigation_mode == "wander"
+            else self.resume_exploration_after_failure
+        )
+
+        goal_handle = self.active_navigation_goal_handle
+        if goal_handle is not None:
+            try:
+                goal_handle.cancel_goal_async()
+            except Exception as ex:  # noqa: BLE001
+                self.get_logger().warn(
+                    f"Failed to cancel timed-out Nav2 goal: {ex}"
+                )
+
+        self.stop_robot()
+        self.get_logger().warn(
+            "Nav2 execution timed out after "
+            f"{self.navigation_timeout_s:.1f} s; "
+            f"generation={generation}, mode={navigation_mode}."
+        )
+        self.finish_execution(
+            generation,
+            success=False,
+            failure_reason=constants.FAILURE_NAVIGATION_TIMEOUT,
+            resume_exploration=resume_after_failure,
+            navigation_result=RobotinoPolicyOutcome.NAV_CANCELED,
+        )
+
+    # ------------------------------------------------------------------
+    # Recovery-aware semantic completion
+    # ------------------------------------------------------------------
+
+    def check_interaction_completion(self) -> None:
+        """Complete charging only after the recovery threshold is reached."""
+        context = self.get_waiting_context()
+        if context is None:
+            return
+
+        policy = context["policy"]
+        policy_id = int(policy.policy_id)
+        generation = int(context["generation"])
+
+        if self.latest_foraging_state is None:
+            return
+
+        if policy_id != self.POLICY_RETURN_TO_BEST_ENERGY_BANK:
+            # Preserve the existing goal/reward behavior from the mixin.
+            InteractionWaitingMixin.check_interaction_completion(self)
+            return
+
+        if context.get("arrival_energy") is None:
+            baseline = self.get_current_energy()
+            context["arrival_energy"] = baseline
+            context["last_progress_energy"] = baseline
+            context["recharge_detected"] = False
+            return
+
+        arrival_energy = float(context["arrival_energy"])
+        current_energy = self.get_current_energy()
+        energy_delta = current_energy - arrival_energy
+
+        last_progress_energy = float(
+            context.get("last_progress_energy", arrival_energy)
+        )
+        if current_energy - last_progress_energy >= self.energy_progress_delta:
+            context["last_progress_energy"] = current_energy
+            context["interaction_deadline_ns"] = (
+                self.get_clock().now().nanoseconds
+                + int(self.interaction_timeout_s * 1e9)
+            )
+
+        if energy_delta >= self.energy_success_delta:
+            if not bool(context.get("recharge_detected", False)):
+                context["recharge_detected"] = True
+                self.get_logger().info(
+                    "Charging detected; keeping return_to_energy active until "
+                    f"energy reaches {self.resume_energy_threshold:.3f}."
+                )
+
+        if current_energy >= self.resume_energy_threshold:
+            recharge_detected = bool(context.get("recharge_detected", False))
+            self.get_logger().info(
+                "Energy recovery complete: "
+                f"energy={current_energy:.3f}, "
+                f"threshold={self.resume_energy_threshold:.3f}, "
+                f"gain={energy_delta:.3f}."
+            )
+            self.finish_execution(
+                generation,
+                success=True,
+                failure_reason=constants.FAILURE_NONE,
+                resume_exploration=self.resume_exploration_after_energy,
+                navigation_result=RobotinoPolicyOutcome.NAV_SUCCEEDED,
+                tag_result=RobotinoPolicyOutcome.TAG_FOUND,
+                recharge_attempted=True,
+                recharge_succeeded=recharge_detected,
+            )
+            return
+
+        remaining = self.target_resource_remaining(policy)
+        if remaining is not None and remaining <= self.resource_empty_epsilon:
+            recharge_detected = bool(context.get("recharge_detected", False))
+            self.get_logger().warn(
+                "Energy bank depleted before recovery completed: "
+                f"tag_id={int(policy.target_tag_id)}, "
+                f"remaining={remaining:.4f}, "
+                f"energy={current_energy:.3f}, "
+                f"required={self.resume_energy_threshold:.3f}."
+            )
+            self.finish_execution(
+                generation,
+                success=False,
+                failure_reason=constants.FAILURE_RECHARGE_FAILED,
+                resume_exploration=self.resume_exploration_after_failure,
+                navigation_result=RobotinoPolicyOutcome.NAV_SUCCEEDED,
+                tag_result=RobotinoPolicyOutcome.TAG_FOUND,
+                recharge_attempted=True,
+                recharge_succeeded=recharge_detected,
+            )
+
+    def target_resource_remaining(
+        self,
+        policy: RobotinoSelectedPolicy,
+    ) -> Optional[float]:
+        """Return remaining resource only for a visible matching target tag."""
+        state = self.latest_foraging_state
+        if state is None or not hasattr(state, "resource_remaining"):
+            return None
+
+        visible = bool(
+            getattr(
+                state,
+                "visible",
+                getattr(state, "tag_visible", False),
+            )
+        )
+        if not visible:
+            return None
+
+        observed_tag_id = int(getattr(state, "tag_id", -1))
+        if observed_tag_id != int(policy.target_tag_id):
+            return None
+
+        if hasattr(state, "is_energy_bank") and not bool(state.is_energy_bank):
+            return None
+
+        try:
+            return max(0.0, float(state.resource_remaining))
+        except (TypeError, ValueError):
+            return None
 
 
 def main(args=None) -> None:
