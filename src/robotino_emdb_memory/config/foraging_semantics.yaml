@@ -8,12 +8,13 @@ tags:
     normal_vector: [0.0, -1.0, 0.0]
 
   1:
-    type: low_energy_bank
+    type: high_energy_bank
     is_energy_bank: true
-    capacity: 0.40
-    collection_rate: 0.06
-    regen_rate: 0.004
-    normal_vector: [1.0, 0.0, 0.0]
+    capacity: 0.90
+    collection_rate: 0.16
+    regen_rate: 0.0
+    normal_vector: [0.0, -1.0, 0.0]
+
 
   2:
     type: medium_energy_bank
@@ -31,12 +32,12 @@ tags:
     normal_vector: [0.0, 1.0, 0.0]
 
   4:
-    type: high_energy_bank
+    type: low_energy_bank
     is_energy_bank: true
-    capacity: 0.90
-    collection_rate: 0.16
-    regen_rate: 0.0
-    normal_vector: [0.0, -1.0, 0.0]
+    capacity: 0.40
+    collection_rate: 0.06
+    regen_rate: 0.004
+    normal_vector: [1.0, 0.0, 0.0]
 
   5:
     type: goal_marker

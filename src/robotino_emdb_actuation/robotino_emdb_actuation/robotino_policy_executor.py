@@ -40,7 +40,7 @@ from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from nav2_msgs.action import ComputePathToPose, NavigateToPose
-from std_msgs.msg import Bool, Float32
+from std_msgs.msg import Bool, Float32, Int32
 from tf2_ros import Buffer, TransformListener
 
 from robotino_emdb_interfaces.msg import (
@@ -58,6 +58,13 @@ from .navigation_execution import NavigationExecutionMixin
 from .navigation_planning import NavigationPlanningMixin
 from .outcome_publishing import OutcomePublishingMixin
 from .policy_dispatch import PolicyDispatchMixin
+
+from rclpy.qos import (
+    QoSProfile,
+    ReliabilityPolicy,
+    DurabilityPolicy,
+    HistoryPolicy,
+)
 
 MIN_DISTANCE_EPSILON_M = 0.001
 
@@ -87,6 +94,7 @@ class RobotinoPolicyExecutor(
 
     CMD_VEL_TOPIC = "/cmd_vel"
     EXPLORATION_ENABLE_TOPIC = "/robotino/emdb/frontier_exploration_enable"
+    RECHARGE_TARGET_TOPIC = "/robotino/emdb/recharge_target"
 
     NAV2_ACTION_NAME = "navigate_to_pose"
     COMPUTE_PATH_ACTION_NAME = "compute_path_to_pose"
@@ -103,7 +111,7 @@ class RobotinoPolicyExecutor(
         self.declare_parameter("robot_base_frame", "base_link")
         self.declare_parameter("enable_nav2_execution", False)
         self.declare_parameter("minimum_goal_interval_s", 0.0)
-        self.declare_parameter("navigation_timeout_s", 45.0)
+        self.declare_parameter("navigation_timeout_s", 90.0)
 
         # Tag approach geometry. These are center-of-base distances from the
         # tag/wall. Robotino radius is about 0.20 m; 0.65 m leaves room for
@@ -119,6 +127,10 @@ class RobotinoPolicyExecutor(
         self.declare_parameter("interaction_check_period_s", 0.20)
         self.declare_parameter("energy_progress_delta", 0.001)
         self.declare_parameter("resource_empty_epsilon", 0.01)
+        self.declare_parameter(
+            "recharge_target_topic",
+            self.RECHARGE_TARGET_TOPIC,
+        )
 
         # After charging, the requested behavior is to continue exploration.
         self.declare_parameter("resume_exploration_after_energy", True)
@@ -202,6 +214,9 @@ class RobotinoPolicyExecutor(
         self.resource_empty_epsilon = max(
             0.0,
             float(self.get_parameter("resource_empty_epsilon").value),
+        )
+        self.recharge_target_topic = str(
+            self.get_parameter("recharge_target_topic").value
         )
         self.resume_exploration_after_energy = bool(
             self.get_parameter("resume_exploration_after_energy").value
@@ -297,6 +312,7 @@ class RobotinoPolicyExecutor(
         self.energy_mode_initialized = False
         self.frontier_exploration_enabled = False
         self.frontier_exploration_mode: Optional[str] = None
+        self.authorized_recharge_target_id = -1
         self.latest_map: Optional[OccupancyGrid] = None
         self.mapping_complete = False
         self.mapping_complete_signal_received = False
@@ -320,6 +336,11 @@ class RobotinoPolicyExecutor(
         self.exploration_enable_publisher = self.create_publisher(
             Bool,
             self.EXPLORATION_ENABLE_TOPIC,
+            10,
+        )
+        self.recharge_target_publisher = self.create_publisher(
+            Int32,
+            self.recharge_target_topic,
             10,
         )
         self.outcome_publisher = self.create_publisher(
@@ -361,11 +382,18 @@ class RobotinoPolicyExecutor(
             self.mapping_complete_callback,
             10,
         )
+        map_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+
         self.map_subscriber = self.create_subscription(
             OccupancyGrid,
             self.map_topic,
             self.map_callback,
-            10,
+            map_qos,
         )
         self.exploration_satisfaction_subscriber = self.create_subscription(
             Float32,
@@ -392,6 +420,7 @@ class RobotinoPolicyExecutor(
 
         self.set_wandering_active(False, force=True)
         self.set_exploration_enabled(False, force=True)
+        self.set_recharge_target(-1, force=True)
         self.get_logger().info(
             "Robotino policy executor ready. "
             f"Nav2 execution={'enabled' if self.enable_nav2_execution else 'disabled'}; "
@@ -402,7 +431,72 @@ class RobotinoPolicyExecutor(
             f"energy>={self.resume_energy_threshold:.2f} or a worthy bank is known; "
             "frontier motion is guarded by the same energy hysteresis; "
             f"Nav2 watchdog={self.navigation_timeout_s:.1f}s; "
-            f"resource empty<={self.resource_empty_epsilon:.3f}."
+            f"resource empty<={self.resource_empty_epsilon:.3f}; "
+            f"recharge authorization={self.recharge_target_topic}."
+        )
+
+    # ------------------------------------------------------------------
+    # Post-arrival recharge authorization and lifecycle
+    # ------------------------------------------------------------------
+
+    def set_recharge_target(
+        self,
+        target_tag_id: int,
+        force: bool = False,
+    ) -> None:
+        """Authorize energy transfer for one tag, or disable it with -1."""
+        target_tag_id = int(target_tag_id)
+        if (
+            not force
+            and target_tag_id == self.authorized_recharge_target_id
+        ):
+            return
+
+        self.authorized_recharge_target_id = target_tag_id
+        msg = Int32()
+        msg.data = target_tag_id
+        self.recharge_target_publisher.publish(msg)
+
+    def finish_execution(
+        self,
+        generation: int,
+        success: bool,
+        failure_reason: str,
+        resume_exploration: bool,
+        navigation_result: int = RobotinoPolicyOutcome.NAV_NOT_USED,
+        tag_result: int = RobotinoPolicyOutcome.TAG_NOT_CHECKED,
+        detection_confidence: Optional[float] = None,
+        observed_tag_pose: Optional[PoseStamped] = None,
+        recharge_attempted: bool = False,
+        recharge_succeeded: bool = False,
+    ) -> None:
+        """Clear recharge authorization before closing any execution."""
+        self.set_recharge_target(-1)
+        ExecutionLifecycleMixin.finish_execution(
+            self,
+            generation=generation,
+            success=success,
+            failure_reason=failure_reason,
+            resume_exploration=resume_exploration,
+            navigation_result=navigation_result,
+            tag_result=tag_result,
+            detection_confidence=detection_confidence,
+            observed_tag_pose=observed_tag_pose,
+            recharge_attempted=recharge_attempted,
+            recharge_succeeded=recharge_succeeded,
+        )
+
+    def cancel_current_execution(
+        self,
+        reason: str,
+        publish_outcome: bool,
+    ) -> None:
+        """Clear recharge authorization before canceling an execution."""
+        self.set_recharge_target(-1)
+        ExecutionLifecycleMixin.cancel_current_execution(
+            self,
+            reason=reason,
+            publish_outcome=publish_outcome,
         )
 
 
@@ -480,12 +574,33 @@ class RobotinoPolicyExecutor(
         generation = int(context["generation"])
 
         if policy_id == self.POLICY_RETURN_TO_BEST_ENERGY_BANK:
+            recharge_succeeded = bool(
+                context.get("recharge_detected", False)
+            )
+            recharge_attempted = bool(
+                context.get("recharge_authorized", False)
+            )
+            if recharge_succeeded:
+                self.get_logger().info(
+                    "Recharge interaction timed out after confirmed energy "
+                    "transfer; recording a successful partial recharge."
+                )
+                self.finish_execution(
+                    generation,
+                    success=True,
+                    failure_reason=constants.FAILURE_NONE,
+                    resume_exploration=False,
+                    navigation_result=RobotinoPolicyOutcome.NAV_SUCCEEDED,
+                    tag_result=RobotinoPolicyOutcome.TAG_FOUND,
+                    recharge_attempted=True,
+                    recharge_succeeded=True,
+                )
+                return
+
             failure_reason = constants.FAILURE_RECHARGE_TIMEOUT
             event_description = (
-                "energy_interaction_timeout_before_recovery_threshold"
+                "energy_interaction_timeout_without_confirmed_transfer"
             )
-            recharge_attempted = True
-            recharge_succeeded = bool(context.get("recharge_detected", False))
         elif policy_id == self.POLICY_GOAL:
             failure_reason = constants.FAILURE_GOAL_NOT_CONFIRMED
             event_description = "goal_interaction_timeout_no_reward_detected"
@@ -563,7 +678,7 @@ class RobotinoPolicyExecutor(
     # ------------------------------------------------------------------
 
     def check_interaction_completion(self) -> None:
-        """Complete charging only after the recovery threshold is reached."""
+        """Authorize charging after arrival, then report its real result."""
         context = self.get_waiting_context()
         if context is None:
             return
@@ -580,15 +695,57 @@ class RobotinoPolicyExecutor(
             InteractionWaitingMixin.check_interaction_completion(self)
             return
 
+        current_energy = self.get_current_energy()
         if context.get("arrival_energy") is None:
-            baseline = self.get_current_energy()
-            context["arrival_energy"] = baseline
-            context["last_progress_energy"] = baseline
+            context["arrival_energy"] = current_energy
+            context["last_progress_energy"] = current_energy
+
+        # Phase 1: Nav2 has succeeded, but collection is still disabled. Wait
+        # until perception confirms the selected tag is visible and has energy.
+        if not bool(context.get("recharge_authorized", False)):
+            remaining = self.target_resource_remaining(policy)
+            if remaining is None:
+                return
+
+            if remaining <= self.resource_empty_epsilon:
+                self.get_logger().warn(
+                    "Reached and found the selected energy bank, but it has "
+                    "no usable resource: "
+                    f"tag_id={int(policy.target_tag_id)}, "
+                    f"remaining={remaining:.4f}."
+                )
+                self.finish_execution(
+                    generation,
+                    success=False,
+                    failure_reason=constants.FAILURE_RECHARGE_FAILED,
+                    resume_exploration=self.resume_exploration_after_failure,
+                    navigation_result=RobotinoPolicyOutcome.NAV_SUCCEEDED,
+                    tag_result=RobotinoPolicyOutcome.TAG_FOUND,
+                    recharge_attempted=True,
+                    recharge_succeeded=False,
+                )
+                return
+
+            context["recharge_authorized"] = True
+            context["arrival_energy"] = current_energy
+            context["last_progress_energy"] = current_energy
             context["recharge_detected"] = False
+            context["interaction_deadline_ns"] = (
+                self.get_clock().now().nanoseconds
+                + int(self.interaction_timeout_s * 1e9)
+            )
+            self.set_recharge_target(int(policy.target_tag_id))
+            self.get_logger().info(
+                "Return-to-energy navigation and resource verification "
+                "succeeded; authorizing transfer now: "
+                f"tag_id={int(policy.target_tag_id)}, "
+                f"remaining={remaining:.4f}, "
+                f"energy={current_energy:.3f}."
+            )
             return
 
+        # Phase 2: only now may the memory/world model transfer resource.
         arrival_energy = float(context["arrival_energy"])
-        current_energy = self.get_current_energy()
         energy_delta = current_energy - arrival_energy
 
         last_progress_energy = float(
@@ -605,12 +762,12 @@ class RobotinoPolicyExecutor(
             if not bool(context.get("recharge_detected", False)):
                 context["recharge_detected"] = True
                 self.get_logger().info(
-                    "Charging detected; keeping return_to_energy active until "
-                    f"energy reaches {self.resume_energy_threshold:.3f}."
+                    "Authorized recharge confirmed: "
+                    f"energy increased by {energy_delta:.3f}."
                 )
 
-        if current_energy >= self.resume_energy_threshold:
-            recharge_detected = bool(context.get("recharge_detected", False))
+        recharge_detected = bool(context.get("recharge_detected", False))
+        if recharge_detected and current_energy >= self.resume_energy_threshold:
             self.get_logger().info(
                 "Energy recovery complete: "
                 f"energy={current_energy:.3f}, "
@@ -625,30 +782,49 @@ class RobotinoPolicyExecutor(
                 navigation_result=RobotinoPolicyOutcome.NAV_SUCCEEDED,
                 tag_result=RobotinoPolicyOutcome.TAG_FOUND,
                 recharge_attempted=True,
-                recharge_succeeded=recharge_detected,
+                recharge_succeeded=True,
             )
             return
 
         remaining = self.target_resource_remaining(policy)
-        if remaining is not None and remaining <= self.resource_empty_epsilon:
-            recharge_detected = bool(context.get("recharge_detected", False))
-            self.get_logger().warn(
-                "Energy bank depleted before recovery completed: "
+        if remaining is None or remaining > self.resource_empty_epsilon:
+            return
+
+        if recharge_detected:
+            self.get_logger().info(
+                "Energy bank exhausted after a successful partial recharge: "
                 f"tag_id={int(policy.target_tag_id)}, "
-                f"remaining={remaining:.4f}, "
-                f"energy={current_energy:.3f}, "
-                f"required={self.resume_energy_threshold:.3f}."
+                f"energy={current_energy:.3f}, gain={energy_delta:.3f}. "
+                "The policy succeeds, but exploration remains disabled so "
+                "eMDB can select another recovery action if still needed."
             )
             self.finish_execution(
                 generation,
-                success=False,
-                failure_reason=constants.FAILURE_RECHARGE_FAILED,
-                resume_exploration=self.resume_exploration_after_failure,
+                success=True,
+                failure_reason=constants.FAILURE_NONE,
+                resume_exploration=False,
                 navigation_result=RobotinoPolicyOutcome.NAV_SUCCEEDED,
                 tag_result=RobotinoPolicyOutcome.TAG_FOUND,
                 recharge_attempted=True,
-                recharge_succeeded=recharge_detected,
+                recharge_succeeded=True,
             )
+            return
+
+        self.get_logger().warn(
+            "Authorized bank became empty without a confirmed energy increase: "
+            f"tag_id={int(policy.target_tag_id)}, "
+            f"remaining={remaining:.4f}."
+        )
+        self.finish_execution(
+            generation,
+            success=False,
+            failure_reason=constants.FAILURE_RECHARGE_FAILED,
+            resume_exploration=self.resume_exploration_after_failure,
+            navigation_result=RobotinoPolicyOutcome.NAV_SUCCEEDED,
+            tag_result=RobotinoPolicyOutcome.TAG_FOUND,
+            recharge_attempted=True,
+            recharge_succeeded=False,
+        )
 
     def target_resource_remaining(
         self,

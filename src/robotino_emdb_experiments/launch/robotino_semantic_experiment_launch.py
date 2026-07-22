@@ -29,8 +29,11 @@ def launch_setup(context: LaunchContext, *args, **kwargs):
     robot_frame = LaunchConfiguration("robot_frame")
     camera_frame = LaunchConfiguration("camera_frame")
     semantics_file = LaunchConfiguration("semantics_file")
-    mapping_complete_topic = LaunchConfiguration('mapping_complete_topic')
-    mapping_progress_topic = LaunchConfiguration('mapping_progress_topic') 
+    foraging_memory_parameters_file = LaunchConfiguration(
+        "foraging_memory_parameters_file"
+    )
+    mapping_complete_topic = LaunchConfiguration("mapping_complete_topic")
+    mapping_progress_topic = LaunchConfiguration("mapping_progress_topic")
 
     enable_nav2_execution = LaunchConfiguration("enable_nav2_execution")
     nav2_action_name = LaunchConfiguration("nav2_action_name")
@@ -46,13 +49,21 @@ def launch_setup(context: LaunchContext, *args, **kwargs):
     experiment_file = LaunchConfiguration("experiment_file")
 
     # Official GII e-MDB runtime.
+    # Do not force a launch-level node name on Commander because it creates
+    # additional cognitive nodes dynamically in the same process.
     commander_node = Node(
         package="core",
         executable="commander",
-        name="commander",
         output="screen",
         arguments=["--ros-args", "--log-level", log_level],
-        parameters=[{"random_seed": random_seed}],
+        parameters=[
+            {
+                "random_seed": ParameterValue(
+                    random_seed,
+                    value_type=int,
+                )
+            }
+        ],
     )
 
     ltm_node = Node(
@@ -125,41 +136,47 @@ def launch_setup(context: LaunchContext, *args, **kwargs):
         ],
     )
 
-    # 4. Factual-state adapter for official GII DriveExponential nodes.
-    cognitive_signals_node = Node(
-        package='robotino_emdb_motivation',
-        executable='cognitive_signals',
-        name='robotino_cognitive_signals',
-        output='screen',
-        emulate_tty=True,
-        parameters=[{
-            'foraging_topic': '/robotino/emdb/foraging_state',
-            'mapping_complete_topic': mapping_complete_topic,
-            'mapping_progress_topic': mapping_progress_topic,
-            'energy_satisfaction_topic':
-                '/robotino/emdb/satisfaction/energy',
-            'resource_satisfaction_topic':
-                '/robotino/emdb/satisfaction/resource_knowledge',
-            'exploration_satisfaction_topic':
-                '/robotino/emdb/satisfaction/exploration',
-            'mission_satisfaction_topic':
-                '/robotino/emdb/satisfaction/mission',
-            'publish_period_s': 0.2,
-        }]
-    )
-
     foraging_memory_node = Node(
         package="robotino_emdb_memory",
         executable="foraging_memory",
-        name="foraging_memory",
+        # Keep the node's internal name, ``robotino_foraging_memory``, so it
+        # matches the top-level key in foraging_memory_parameters.yaml.
         output="screen",
         emulate_tty=True,
         parameters=[
+            # General memory behavior comes from the YAML file.
+            foraging_memory_parameters_file,
+            # Launch-specific wiring intentionally overrides YAML entries.
             {
                 "input_topic": output_topic,
                 "outcome_topic": "/robotino/emdb/policy_outcome",
                 "output_topic": "/robotino/emdb/foraging_state",
                 "semantics_file": semantics_file,
+            },
+        ],
+    )
+
+    # Factual-state adapter for the official GII DriveExponential nodes.
+    cognitive_signals_node = Node(
+        package="robotino_emdb_motivation",
+        executable="cognitive_signals",
+        name="robotino_cognitive_signals",
+        output="screen",
+        emulate_tty=True,
+        parameters=[
+            {
+                "foraging_topic": "/robotino/emdb/foraging_state",
+                "mapping_complete_topic": mapping_complete_topic,
+                "mapping_progress_topic": mapping_progress_topic,
+                "energy_satisfaction_topic":
+                    "/robotino/emdb/satisfaction/energy",
+                "resource_satisfaction_topic":
+                    "/robotino/emdb/satisfaction/resource_knowledge",
+                "exploration_satisfaction_topic":
+                    "/robotino/emdb/satisfaction/exploration",
+                "mission_satisfaction_topic":
+                    "/robotino/emdb/satisfaction/mission",
+                "publish_period_s": 0.2,
             }
         ],
     )
@@ -238,8 +255,8 @@ def launch_setup(context: LaunchContext, *args, **kwargs):
         shutdown_on_commander_exit,
         TimerAction(period=1.0, actions=[apriltag_tf_bridge_node]),
         TimerAction(period=2.0, actions=[foraging_memory_node]),
-        TimerAction(period=3.0,actions=[cognitive_signals_node]), 
         TimerAction(period=2.0, actions=[load_commander_config]),
+        TimerAction(period=3.0, actions=[cognitive_signals_node]),
         TimerAction(period=3.0, actions=[policy_execution_bridge_node]),
         TimerAction(period=4.0, actions=[policy_executor_node]),
         TimerAction(period=7.0, actions=[load_experiment_config]),
@@ -252,6 +269,14 @@ def generate_launch_description():
             FindPackageShare("robotino_emdb_memory"),
             "config",
             "foraging_semantics.yaml",
+        ]
+    )
+
+    default_foraging_memory_parameters_file = PathJoinSubstitution(
+        [
+            FindPackageShare("robotino_emdb_memory"),
+            "config",
+            "foraging_memory_parameters.yaml",
         ]
     )
 
@@ -288,14 +313,25 @@ def generate_launch_description():
                 description="YAML file defining semantic tag meanings.",
             ),
             DeclareLaunchArgument(
+                "foraging_memory_parameters_file",
+                default_value=default_foraging_memory_parameters_file,
+                description=(
+                    "ROS parameter YAML for the Robotino foraging-memory node."
+                ),
+            ),
+            DeclareLaunchArgument(
                 "mapping_complete_topic",
                 default_value="/frontier_exploration/mapping_complete",
-                description="Bool topic indicating frontier exploration is complete.",
+                description=(
+                    "Bool topic indicating frontier exploration is complete."
+                ),
             ),
             DeclareLaunchArgument(
                 "mapping_progress_topic",
                 default_value="",
-                description="Optional Float32 topic with exploration progress in [0, 1].",
+                description=(
+                    "Optional Float32 topic with exploration progress in [0, 1]."
+                ),
             ),
             DeclareLaunchArgument(
                 "enable_nav2_execution",

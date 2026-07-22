@@ -1,0 +1,21 @@
+robotino_foraging_memory:
+  ros__parameters:
+    low_energy_threshold: 0.35
+    resume_energy_threshold: 0.70
+
+    # Reject a bank unless its observed amount can complete recovery.
+    require_full_recovery_supply: false
+    resource_empty_epsilon: 0.01
+    actionable_supply_epsilon: 0.005
+    recovery_supply_margin: 0.0
+
+    # While recovery is incomplete, do not publish empty/insufficient banks as
+    # best_energy_tag_id. With no actionable known bank, eMDB must select
+    # search_for_energy and explore for another resource.
+    allow_nonactionable_verification_during_recovery: false
+
+    # Outside recovery, delayed verification remains possible for renewables.
+    depleted_verification_score_factor: 0.10
+    depleted_retry_delay_s: 60.0
+    insufficient_verification_score_factor: 0.05
+    insufficient_supply_retry_delay_s: 60.0

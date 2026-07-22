@@ -1,6 +1,6 @@
 Experiment:
   name: main_loop
-  class_name: cognitive_processes.main_loop.MainLoop
+  class_name: robotino_emdb_decision.robotino_main_loop.RobotinoMainLoop
   new_executor: true
   threads: 4
   parameters:
@@ -10,6 +10,8 @@ Experiment:
     softmax_selection: false
     softmax_temperature: 0.3
     kill_on_finish: false
+    ltm_neighbor_response_timeout_s: 2.0
+    ltm_neighbor_confirmation_timeout_s: 2.0
 Control:
   id: robotino_control
   control_topic: /main_loop/control
@@ -41,7 +43,7 @@ LTM:
       parameters:
         default_msg: robotino_emdb_interfaces.msg.RobotinoForagingState
         default_topic: /robotino/emdb/foraging_state
-        mapping_complete_topic: ''
+        mapping_complete_topic: /robotino/emdb/exploration_complete
         exploration_satisfaction_topic: /robotino/emdb/satisfaction/exploration
         frontiers_available_topic: ''
         low_energy_threshold: 0.35

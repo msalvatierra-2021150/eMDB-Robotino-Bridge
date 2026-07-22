@@ -1,34 +1,17 @@
 #!/usr/bin/env python3
 """Robotino-specific semantic/resource memory for the GII e-MDB integration.
 
-This node is NOT the e-MDB LTM. The official e-MDB LTM stores cognitive nodes,
-contexts, P-Node points/anti-points, C-Nodes, and learned policy relations.
-
-This node stores concrete Robotino facts that the generic architecture cannot
-know by itself:
-  * tag IDs and semantic types;
-  * robust map positions and successful observation poses;
-  * last-observed resource amounts;
-  * per-tag evidence for presence, reachability and recharge reliability.
-
-The configured regeneration rate is used only by a private resource-world
-model. It is never stored in Robotino's learned tag memory or used directly
-to predict that a depleted resource has become available again.
-
-It publishes RobotinoForagingState. A custom official e-MDB Perception node
-normalizes that message and publishes /perception/foraging_state/value.
-
-The official e-MDB MainLoop must create episodes and rewards. Therefore this
-node no longer maintains its own episode list or calculates novelty/goal reward.
+The node stores factual tag/resource memory while the official e-MDB LTM owns
+cognitive nodes and learned policy relations.  Implementation details are split
+into mixins so ranking, resource simulation, persistence, observations, and
+policy-outcome evidence can evolve independently.
 """
 
-import math
-import statistics
 from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
-import yaml
+from std_msgs.msg import Int32
 
 from robotino_emdb_interfaces.msg import (
     RobotinoForagingState,
@@ -36,22 +19,42 @@ from robotino_emdb_interfaces.msg import (
     RobotinoTag,
 )
 
+try:
+    from .foraging_memory_mixins import (
+        EnergyBankRankingMixin,
+        MemoryCommonMixin,
+        PolicyOutcomeMixin,
+        ResourceSimulationMixin,
+        SemanticsPersistenceMixin,
+        StateObservationMixin,
+    )
+except ImportError:  # Direct execution during local debugging.
+    from foraging_memory_mixins import (
+        EnergyBankRankingMixin,
+        MemoryCommonMixin,
+        PolicyOutcomeMixin,
+        ResourceSimulationMixin,
+        SemanticsPersistenceMixin,
+        StateObservationMixin,
+    )
 
-# Robust tag-position estimation constants.
-TAG_POSITION_WINDOW_SIZE = 15
-TAG_POSITION_MIN_SAMPLES = 5
-TAG_POSITION_OUTLIER_GATE_M = 0.45
-TAG_POSITION_EMA_ALPHA = 0.25
 
-
-class RobotinoForagingMemory(Node):
+class RobotinoForagingMemory(
+    StateObservationMixin,
+    PolicyOutcomeMixin,
+    EnergyBankRankingMixin,
+    ResourceSimulationMixin,
+    SemanticsPersistenceMixin,
+    MemoryCommonMixin,
+    Node,
+):
     """Maintain Robotino's factual resource registry and reliability evidence."""
 
     def __init__(self):
         super().__init__("robotino_foraging_memory")
 
         # ------------------------------------------------------------------
-        # Parameters
+        # Files and topics
         # ------------------------------------------------------------------
         self.declare_parameter(
             "semantics_file",
@@ -63,7 +66,6 @@ class RobotinoForagingMemory(Node):
             "~/.robotino_emdb/robotino_resource_memory.yaml",
         )
         self.declare_parameter("persist_memory", True)
-
         self.declare_parameter(
             "input_topic", "/robotino/emdb/tag_observation"
         )
@@ -73,16 +75,44 @@ class RobotinoForagingMemory(Node):
         self.declare_parameter(
             "output_topic", "/robotino/emdb/foraging_state"
         )
+        self.declare_parameter(
+            "recharge_target_topic",
+            "/robotino/emdb/recharge_target",
+        )
 
+        # ------------------------------------------------------------------
+        # Robot energy and recovery-aware bank eligibility
+        # ------------------------------------------------------------------
         self.declare_parameter("initial_energy", 1.0)
-        self.declare_parameter("energy_decay_per_second", 0.01)
+        self.declare_parameter("energy_decay_per_second", 0.005)
         self.declare_parameter("low_energy_threshold", 0.35)
+        self.declare_parameter("resume_energy_threshold", 0.50)
+
+        # When true, a bank is actionable only when its observed amount can
+        # close the full energy gap to resume_energy_threshold after decay.
+        self.declare_parameter("require_full_recovery_supply", True)
+        self.declare_parameter("resource_empty_epsilon", 0.01)
+        self.declare_parameter("actionable_supply_epsilon", 0.005)
+        self.declare_parameter("recovery_supply_margin", 0.0)
+
+        # During energy recovery, only banks that can complete recovery may be
+        # published as best_energy_tag_id. This forces search_for_energy when
+        # every remembered bank is empty or insufficient. Outside recovery,
+        # delayed verification candidates can still support renewable-resource
+        # learning without trapping the Robotino at a known depleted bank.
+        self.declare_parameter(
+            "allow_nonactionable_verification_during_recovery", False
+        )
+        self.declare_parameter("depleted_verification_score_factor", 0.10)
+        self.declare_parameter("depleted_retry_delay_s", 60.0)
+        self.declare_parameter("insufficient_verification_score_factor", 0.05)
+        self.declare_parameter("insufficient_supply_retry_delay_s", 60.0)
 
         self.declare_parameter("arrival_distance", 1.2)
         self.declare_parameter("same_tag_event_gap", 3.0)
         self.declare_parameter("state_publish_rate_hz", 5.0)
 
-        # Evidence weights for the three requested outcomes.
+        # Evidence weights for the learned factual outcomes.
         self.declare_parameter("successful_recharge_weight", 2.0)
         self.declare_parameter("failed_recharge_weight", 1.0)
         self.declare_parameter("navigation_failure_weight", 1.0)
@@ -91,8 +121,6 @@ class RobotinoForagingMemory(Node):
         self.declare_parameter("unreachable_confidence_threshold", 0.35)
         self.declare_parameter("missing_after_consecutive_failures", 2)
         self.declare_parameter("unreachable_after_consecutive_failures", 2)
-        self.declare_parameter("depleted_verification_score_factor", 0.10)
-        self.declare_parameter("depleted_retry_delay_s", 60.0)
 
         # ------------------------------------------------------------------
         # Read parameters
@@ -100,23 +128,80 @@ class RobotinoForagingMemory(Node):
         self.input_topic = str(self.get_parameter("input_topic").value)
         self.outcome_topic = str(self.get_parameter("outcome_topic").value)
         self.output_topic = str(self.get_parameter("output_topic").value)
-
-        self.robot_energy = float(self.get_parameter("initial_energy").value)
-        self.energy_decay_per_second = float(
-            self.get_parameter("energy_decay_per_second").value
-        )
-        self.low_energy_threshold = float(
-            self.get_parameter("low_energy_threshold").value
+        self.recharge_target_topic = str(
+            self.get_parameter("recharge_target_topic").value
         )
 
-        self.arrival_distance = float(
-            self.get_parameter("arrival_distance").value
+        self.robot_energy = self.clamp(
+            self.get_parameter("initial_energy").value,
+            0.0,
+            1.0,
         )
-        self.same_tag_event_gap = float(
-            self.get_parameter("same_tag_event_gap").value
+        self.energy_decay_per_second = max(
+            0.0,
+            float(self.get_parameter("energy_decay_per_second").value),
+        )
+        self.low_energy_threshold = self.clamp(
+            self.get_parameter("low_energy_threshold").value,
+            0.0,
+            1.0,
+        )
+        self.resume_energy_threshold = self.clamp(
+            self.get_parameter("resume_energy_threshold").value,
+            self.low_energy_threshold,
+            1.0,
+        )
+        self.require_full_recovery_supply = bool(
+            self.get_parameter("require_full_recovery_supply").value
+        )
+        self.resource_empty_epsilon = max(
+            0.0,
+            float(self.get_parameter("resource_empty_epsilon").value),
+        )
+        self.actionable_supply_epsilon = max(
+            0.0,
+            float(self.get_parameter("actionable_supply_epsilon").value),
+        )
+        self.recovery_supply_margin = max(
+            0.0,
+            float(self.get_parameter("recovery_supply_margin").value),
+        )
+
+        self.allow_nonactionable_verification_during_recovery = bool(
+            self.get_parameter(
+                "allow_nonactionable_verification_during_recovery"
+            ).value
+        )
+        self.depleted_verification_score_factor = self.clamp(
+            self.get_parameter("depleted_verification_score_factor").value,
+            0.0,
+            1.0,
+        )
+        self.depleted_retry_delay_s = max(
+            0.0,
+            float(self.get_parameter("depleted_retry_delay_s").value),
+        )
+        self.insufficient_verification_score_factor = self.clamp(
+            self.get_parameter("insufficient_verification_score_factor").value,
+            0.0,
+            1.0,
+        )
+        self.insufficient_supply_retry_delay_s = max(
+            0.0,
+            float(self.get_parameter("insufficient_supply_retry_delay_s").value),
+        )
+
+        self.arrival_distance = max(
+            0.0,
+            float(self.get_parameter("arrival_distance").value),
+        )
+        self.same_tag_event_gap = max(
+            0.0,
+            float(self.get_parameter("same_tag_event_gap").value),
         )
         self.state_publish_rate_hz = max(
-            0.2, float(self.get_parameter("state_publish_rate_hz").value)
+            0.2,
+            float(self.get_parameter("state_publish_rate_hz").value),
         )
 
         self.successful_recharge_weight = float(
@@ -143,15 +228,6 @@ class RobotinoForagingMemory(Node):
         self.unreachable_after_consecutive_failures = int(
             self.get_parameter("unreachable_after_consecutive_failures").value
         )
-        self.depleted_verification_score_factor = self.clamp(
-            self.get_parameter("depleted_verification_score_factor").value,
-            0.0,
-            1.0,
-        )
-        self.depleted_retry_delay_s = max(
-            0.0,
-            float(self.get_parameter("depleted_retry_delay_s").value),
-        )
 
         self.persist_memory = bool(
             self.get_parameter("persist_memory").value
@@ -168,10 +244,6 @@ class RobotinoForagingMemory(Node):
         )
         self.tag_semantics = self.load_tag_semantics(self.semantics_file)
         self.warned_unknown_tag_ids = set()
-
-        # Private environment truth. The regeneration rate remains available
-        # here for resource simulation, but is never copied into learned
-        # Robotino tag memory or published to e-MDB.
         self.resource_truth = self.create_resource_truth()
 
         energy_tag_ids = sorted(
@@ -188,12 +260,16 @@ class RobotinoForagingMemory(Node):
                 "Check foraging_semantics.yaml."
             )
 
-        # Key: integer tag ID. Value: factual resource record.
         self.memory = {}
         self.load_resource_memory()
         self.restore_resource_truth_from_memory()
 
         self.goal_satisfied = False
+        self.active_recharge_target_id = -1
+        # Prevent repeated publications of the same authorization command from
+        # restarting collection as a just-drained bank regenerates by crumbs.
+        # The executor's explicit -1 command clears this interaction latch.
+        self.blocked_recharge_target_id = -1
         self.last_logged_best_energy_tag_id = None
         self.last_best_candidate_summary = None
         self.latest_state = self.create_empty_state()
@@ -211,6 +287,12 @@ class RobotinoForagingMemory(Node):
             RobotinoPolicyOutcome,
             self.outcome_topic,
             self.outcome_callback,
+            10,
+        )
+        self.recharge_target_subscriber = self.create_subscription(
+            Int32,
+            self.recharge_target_topic,
+            self.recharge_target_callback,
             10,
         )
         self.publisher = self.create_publisher(
@@ -232,1148 +314,18 @@ class RobotinoForagingMemory(Node):
         self.get_logger().info("Robotino resource memory started")
         self.get_logger().info(f"Tag observations: {self.input_topic}")
         self.get_logger().info(f"Policy outcomes: {self.outcome_topic}")
+        self.get_logger().info(
+            f"Recharge authorization: {self.recharge_target_topic}"
+        )
         self.get_logger().info(f"Foraging state: {self.output_topic}")
         self.get_logger().info(f"Persistent memory: {self.memory_file}")
-
-    # ==================================================================
-    # Generic helpers
-    # ==================================================================
-    @staticmethod
-    def clamp(value, min_value, max_value):
-        return float(max(min_value, min(max_value, float(value))))
-
-    @staticmethod
-    def probability(positive, negative):
-        try:
-            positive = float(positive)
-            negative = float(negative)
-        except (TypeError, ValueError):
-            return 0.5
-        if not math.isfinite(positive) or not math.isfinite(negative):
-            return 0.5
-        positive = max(0.0, positive)
-        negative = max(0.0, negative)
-        total = positive + negative
-        if total <= 0.0:
-            return 0.5
-        return positive / total
-
-    @staticmethod
-    def set_if_available(message, field_name, value):
-        """Set optional fields after RobotinoForagingState.msg is extended."""
-        if hasattr(message, field_name):
-            setattr(message, field_name, value)
-
-    def energy_need(self):
-        if self.low_energy_threshold <= 0.0:
-            return 0.0
-        return self.clamp(
-            (self.low_energy_threshold - self.robot_energy)
-            / self.low_energy_threshold,
-            0.0,
-            1.0,
-        )
-
-    # ==================================================================
-    # Semantic configuration and persistence
-    # ==================================================================
-    def load_tag_semantics(self, semantics_file):
-        path = Path(semantics_file)
-
-        if not path.exists():
-            self.get_logger().warn(
-                f"Semantics file not found: {semantics_file}. Using defaults."
-            )
-            return {
-                0: {
-                    "type": "landmark",
-                    "is_energy_bank": False,
-                    "capacity": 0.0,
-                    "collection_rate": 0.0,
-                    "regen_rate": 0.0,
-                },
-                1: {
-                    "type": "low_energy_bank",
-                    "is_energy_bank": True,
-                    "capacity": 0.30,
-                    "collection_rate": 0.08,
-                    "regen_rate": 0.0,
-                },
-                2: {
-                    "type": "medium_energy_bank",
-                    "is_energy_bank": True,
-                    "capacity": 0.50,
-                    "collection_rate": 0.12,
-                    "regen_rate": 0.0,
-                },
-                3: {
-                    "type": "checkpoint",
-                    "is_energy_bank": False,
-                    "capacity": 0.0,
-                    "collection_rate": 0.0,
-                    "regen_rate": 0.0,
-                },
-                4: {
-                    "type": "high_energy_bank",
-                    "is_energy_bank": True,
-                    "capacity": 0.80,
-                    "collection_rate": 0.18,
-                    "regen_rate": 0.0,
-                },
-                5: {
-                    "type": "goal_marker",
-                    "is_energy_bank": False,
-                    "capacity": 0.0,
-                    "collection_rate": 0.0,
-                    "regen_rate": 0.0,
-                },
-            }
-
-        with path.open("r", encoding="utf-8") as file:
-            data = yaml.safe_load(file) or {}
-
-        semantics = {}
-        for raw_id, tag_data in data.get("tags", {}).items():
-            tag_id = int(raw_id)
-            semantics[tag_id] = {
-                "type": str(tag_data.get("type", "unknown")),
-                "is_energy_bank": bool(
-                    tag_data.get("is_energy_bank", False)
-                ),
-                "capacity": float(tag_data.get("capacity", 0.0)),
-                "collection_rate": float(
-                    tag_data.get("collection_rate", 0.0)
-                ),
-                "regen_rate": float(tag_data.get("regen_rate", 0.0)),
-            }
-
         self.get_logger().info(
-            f"Loaded tag semantics from: {semantics_file}"
+            "Recovery-aware bank selection: "
+            f"resume={self.resume_energy_threshold:.3f}, "
+            f"require_full_supply={self.require_full_recovery_supply}, "
+            f"empty_epsilon={self.resource_empty_epsilon:.3f}, "
+            f"insufficient_retry={self.insufficient_supply_retry_delay_s:.1f}s"
         )
-        return semantics
-
-    def create_resource_truth(self):
-        """Create private physical resource state from semantic YAML.
-
-        This state owns regeneration. It is intentionally separate from
-        ``self.memory`` so Robotino cannot infer availability from regen_rate.
-        """
-        resources = {}
-        for tag_id, semantics in self.tag_semantics.items():
-            if not bool(semantics.get("is_energy_bank", False)):
-                continue
-
-            capacity = max(0.0, float(semantics.get("capacity", 0.0)))
-            resources[int(tag_id)] = {
-                "capacity": capacity,
-                "remaining": capacity,
-                "collection_rate": max(
-                    0.0,
-                    float(semantics.get("collection_rate", 0.0)),
-                ),
-                "regen_rate": max(
-                    0.0,
-                    float(semantics.get("regen_rate", 0.0)),
-                ),
-                "last_update_time": 0.0,
-            }
-        return resources
-
-    def default_evidence(self):
-        return {
-            # A tag enters memory because it was visually detected.
-            "presence_positive": 2.0,
-            "presence_negative": 1.0,
-            # Reachability/recharge begin uncertain.
-            "reachability_positive": 1.0,
-            "reachability_negative": 1.0,
-            "recharge_positive": 1.0,
-            "recharge_negative": 1.0,
-            "navigation_attempts": 0,
-            "navigation_successes": 0,
-            "navigation_failures": 0,
-            "verification_attempts": 0,
-            "verified_absences": 0,
-            "recharge_attempts": 0,
-            "recharge_successes": 0,
-            "consecutive_navigation_failures": 0,
-            "consecutive_not_found": 0,
-            "consecutive_recharge_failures": 0,
-            "last_recharge_attempt_time": 0.0,
-            "status": "UNVERIFIED",
-            "last_outcome": "none",
-            "last_failure_reason": "none",
-        }
-
-    def ensure_memory_schema(self, data):
-        for key, value in self.default_evidence().items():
-            data.setdefault(key, value)
-        data.setdefault("position_samples", [])
-        data["position_samples"] = [
-            (float(sample[0]), float(sample[1]))
-            for sample in data["position_samples"]
-            if isinstance(sample, (list, tuple)) and len(sample) >= 2
-        ]
-        return data
-
-    def apply_current_semantics(self, tag_id, data):
-        """Migrate a remembered record to the currently loaded semantics.
-
-        Earlier runs may have stored a tag as ``unknown`` or as a non-energy
-        tag when the semantics path or tag IDs were wrong.  Without this
-        migration, correcting the YAML would never make that persistent record
-        eligible for best-bank selection.
-        """
-        semantics = self.tag_semantics.get(int(tag_id))
-        if semantics is None:
-            if int(tag_id) not in self.warned_unknown_tag_ids:
-                self.warned_unknown_tag_ids.add(int(tag_id))
-                self.get_logger().warn(
-                    f"Tag {int(tag_id)} is not present in "
-                    f"{self.semantics_file}; it cannot be an energy bank."
-                )
-            return self.ensure_memory_schema(data)
-
-        previous_type = str(data.get("tag_type", "unknown"))
-        previous_is_bank = bool(data.get("is_energy_bank", False))
-
-        data["tag_type"] = str(semantics["type"])
-        data["is_energy_bank"] = bool(semantics["is_energy_bank"])
-        data["resource_capacity"] = float(semantics["capacity"])
-        data["collection_rate"] = float(semantics["collection_rate"])
-        # Remove legacy privileged knowledge from persistent learned memory.
-        data.pop("regen_rate", None)
-        data.setdefault("resource_remaining", float(semantics["capacity"]))
-
-        # Clamp old persisted values to the current configured capacity.
-        capacity = max(0.0, float(data["resource_capacity"]))
-        data["resource_remaining"] = self.clamp(
-            data.get("resource_remaining", capacity),
-            0.0,
-            capacity,
-        )
-
-        if (
-            previous_type != data["tag_type"]
-            or previous_is_bank != data["is_energy_bank"]
-        ):
-            self.get_logger().warn(
-                f"Migrated tag {int(tag_id)} semantics: "
-                f"type {previous_type!r} -> {data['tag_type']!r}, "
-                f"is_energy_bank {previous_is_bank} -> "
-                f"{data['is_energy_bank']}"
-            )
-
-        return self.ensure_memory_schema(data)
-
-    def load_resource_memory(self):
-        if not self.persist_memory or not self.memory_file.exists():
-            return
-
-        try:
-            with self.memory_file.open("r", encoding="utf-8") as file:
-                payload = yaml.safe_load(file) or {}
-
-            raw_tags = payload.get("tags", {})
-            for raw_id, data in raw_tags.items():
-                tag_id = int(raw_id)
-                record = self.apply_current_semantics(
-                    tag_id, dict(data)
-                )
-
-                # ROS simulation time may restart between runs. Keep the facts
-                # and evidence, but restart transient time references.
-                record["last_seen_time"] = 0.0
-                record["last_detection_time"] = 0.0
-                record.pop("last_resource_update_time", None)
-                record.pop("last_collection_time", None)
-                record.pop("regen_rate", None)
-                self.memory[tag_id] = record
-
-            self.get_logger().info(
-                f"Loaded {len(self.memory)} remembered tags"
-            )
-        except (OSError, TypeError, ValueError, yaml.YAMLError) as error:
-            self.get_logger().error(
-                f"Could not load Robotino resource memory: {error}"
-            )
-
-    def restore_resource_truth_from_memory(self):
-        """Resume hidden resource amounts from the last observed values."""
-        for tag_id, data in self.memory.items():
-            resource = self.resource_truth.get(int(tag_id))
-            if resource is None:
-                continue
-            resource["remaining"] = self.clamp(
-                data.get("resource_remaining", resource["capacity"]),
-                0.0,
-                resource["capacity"],
-            )
-            resource["last_update_time"] = 0.0
-            resource.pop("last_collection_time", None)
-
-    def save_resource_memory(self):
-        if not self.persist_memory:
-            return
-
-        try:
-            self.memory_file.parent.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "tags": {
-                    int(tag_id): data
-                    for tag_id, data in sorted(self.memory.items())
-                }
-            }
-            temporary = self.memory_file.with_suffix(
-                self.memory_file.suffix + ".tmp"
-            )
-            with temporary.open("w", encoding="utf-8") as file:
-                yaml.safe_dump(payload, file, sort_keys=True)
-            temporary.replace(self.memory_file)
-        except (OSError, TypeError, ValueError, yaml.YAMLError) as error:
-            self.get_logger().error(
-                f"Could not save Robotino resource memory: {error}"
-            )
-
-    # ==================================================================
-    # State publication
-    # ==================================================================
-    def create_empty_state(self):
-        state = RobotinoForagingState()
-        state.valid = False
-        state.visible = False
-        state.tag_id = -1
-        state.tag_type = "none"
-        state.robot_energy = float(self.robot_energy)
-        state.energy_need = self.energy_need()
-        state.goal_satisfied = bool(self.goal_satisfied)
-        self.set_if_available(state, "goal_known", self.goal_known())
-
-        # Compatibility fields: rewards are now owned by e-MDB Goals/Drives.
-        state.novelty_reward = 0.0
-        state.energy_reward = 0.0
-        state.goal_reward = 0.0
-        state.total_reward = 0.0
-
-        self.fill_best_energy_bank(state)
-        return state
-
-    def publish_current_state(self):
-        state = self.latest_state
-        state.header.stamp = self.get_clock().now().to_msg()
-        state.robot_energy = float(self.robot_energy)
-        state.energy_need = self.energy_need()
-        state.goal_satisfied = bool(self.goal_satisfied)
-        self.set_if_available(state, "goal_known", self.goal_known())
-        self.fill_best_energy_bank(state)
-        self.publisher.publish(state)
-
-    def energy_decay_step(self):
-        self.robot_energy = self.clamp(
-            self.robot_energy - self.energy_decay_per_second,
-            0.0,
-            1.0,
-        )
-
-    def goal_known(self):
-        return any(
-            data.get("tag_type") == "goal_marker"
-            for data in self.memory.values()
-        )
-
-    # ==================================================================
-    # Tag observations
-    # ==================================================================
-    def observation_callback(self, msg: RobotinoTag):
-        now_sec = self.get_clock().now().nanoseconds / 1e9
-        state = RobotinoForagingState()
-        state.header = msg.header
-        state.valid = True
-        state.visible = bool(msg.visible)
-        state.robot_energy = float(self.robot_energy)
-        state.energy_need = self.energy_need()
-
-        # Always carry the current robot pose, including empty detections.
-        state.robot_x_map = float(msg.robot_x_map)
-        state.robot_y_map = float(msg.robot_y_map)
-        state.robot_yaw_map = float(msg.robot_yaw_map)
-
-        if not msg.visible or msg.tag_id < 0:
-            self.populate_no_visible_tag_state(state)
-            self.latest_state = state
-            self.publish_current_state()
-            return
-
-        tag_id = int(msg.tag_id)
-        semantics = self.tag_semantics.get(
-            tag_id,
-            {
-                "type": "unknown",
-                "is_energy_bank": False,
-                "capacity": 0.0,
-                "collection_rate": 0.0,
-                "regen_rate": 0.0,
-            },
-        )
-
-        if tag_id not in self.tag_semantics:
-            if tag_id not in self.warned_unknown_tag_ids:
-                self.warned_unknown_tag_ids.add(tag_id)
-                self.get_logger().warn(
-                    f"Observed tag {tag_id}, but it has no entry in "
-                    f"{self.semantics_file}. Current configured IDs: "
-                    f"{sorted(self.tag_semantics)}"
-                )
-
-        first_time_seen = tag_id not in self.memory
-        if first_time_seen:
-            self.create_tag_memory(tag_id, semantics, msg, now_sec)
-        else:
-            # Always reapply current semantics so stale persistent records are
-            # repaired after the YAML is corrected.
-            self.apply_current_semantics(tag_id, self.memory[tag_id])
-            self.update_tag_memory(tag_id, msg, now_sec)
-
-        remembered = self.apply_current_semantics(
-            tag_id, self.memory[tag_id]
-        )
-
-        # A new visual encounter is positive presence evidence, but camera
-        # frames from the same continuous sighting are not counted repeatedly.
-        time_since_last_seen = max(
-            0.0, now_sec - float(remembered.get("last_seen_time", 0.0))
-        )
-        if first_time_seen or time_since_last_seen >= self.same_tag_event_gap:
-            if not first_time_seen:
-                remembered["times_seen"] = int(
-                    remembered.get("times_seen", 0)
-                ) + 1
-                remembered["last_seen_time"] = now_sec
-                remembered["presence_positive"] += 0.25
-            remembered["consecutive_not_found"] = 0
-            remembered["status"] = "ACTIVE"
-
-        remembered["last_detection_time"] = now_sec
-        self.update_resource_bank(tag_id, now_sec)
-        self.observe_resource_bank(tag_id)
-        self.collect_energy_from_bank(tag_id, msg, now_sec)
-
-        self.populate_visible_tag_state(
-            state,
-            msg,
-            tag_id,
-            first_time_seen,
-            remembered,
-            now_sec,
-        )
-
-        self.latest_state = state
-        self.publish_current_state()
-
-    def create_tag_memory(self, tag_id, semantics, msg, now_sec):
-        measurement_x = float(msg.tag_x_map)
-        measurement_y = float(msg.tag_y_map)
-
-        data = {
-            "tag_type": str(semantics["type"]),
-            "first_seen_time": now_sec,
-            "last_seen_time": now_sec,
-            "last_detection_time": now_sec,
-            "times_seen": 1,
-            "position_samples": [(measurement_x, measurement_y)],
-            "accepted_pose_samples": 1,
-            "rejected_pose_samples": 0,
-            "tag_x_map": measurement_x - 0.05,
-            "tag_y_map": measurement_y,
-            "tag_yaw_map": float(msg.tag_yaw_map),
-            "last_seen_robot_x_map": float(msg.robot_x_map),
-            "last_seen_robot_y_map": float(msg.robot_y_map),
-            "last_seen_robot_yaw_map": float(msg.robot_yaw_map),
-            "best_observation_confidence": float(msg.confidence),
-            "best_observation_time": now_sec,
-            "best_observation_distance": float(msg.distance),
-            "best_observation_bearing": float(msg.bearing),
-            "is_energy_bank": bool(semantics["is_energy_bank"]),
-            "resource_capacity": float(semantics["capacity"]),
-            # This is the last amount Robotino has observed, not a
-            # time-predicted value derived from the regeneration rate.
-            "resource_remaining": float(semantics["capacity"]),
-            "collection_rate": float(semantics["collection_rate"]),
-        }
-        data.update(self.default_evidence())
-        data["status"] = "ACTIVE"
-        self.memory[tag_id] = data
-
-        self.get_logger().info(
-            f"Remembered new tag {tag_id} ({data['tag_type']}), "
-            f"is_energy_bank={data['is_energy_bank']}, "
-            f"resource_remaining={data['resource_remaining']:.3f}"
-        )
-        # Do not rely only on the five-second timer. A newly discovered tag is
-        # important enough to persist immediately.
-        self.save_resource_memory()
-
-    def update_tag_memory(self, tag_id, msg, now_sec):
-        remembered = self.ensure_memory_schema(self.memory[tag_id])
-        measurement_x = float(msg.tag_x_map)
-        measurement_y = float(msg.tag_y_map)
-        samples = remembered.setdefault("position_samples", [])
-
-        accept_measurement = True
-        if len(samples) >= TAG_POSITION_MIN_SAMPLES:
-            median_x = statistics.median(sample[0] for sample in samples)
-            median_y = statistics.median(sample[1] for sample in samples)
-            error_from_median = math.hypot(
-                measurement_x - median_x,
-                measurement_y - median_y,
-            )
-            accept_measurement = error_from_median <= TAG_POSITION_OUTLIER_GATE_M
-
-            if not accept_measurement:
-                remembered["rejected_pose_samples"] = int(
-                    remembered.get("rejected_pose_samples", 0)
-                ) + 1
-                self.get_logger().warn(
-                    f"Rejected tag {tag_id} position sample "
-                    f"({measurement_x:.2f}, {measurement_y:.2f}); "
-                    f"{error_from_median:.2f} m from rolling median"
-                )
-
-        if accept_measurement:
-            samples.append((measurement_x, measurement_y))
-            del samples[:-TAG_POSITION_WINDOW_SIZE]
-            remembered["accepted_pose_samples"] = int(
-                remembered.get("accepted_pose_samples", 0)
-            ) + 1
-
-            median_x = statistics.median(sample[0] for sample in samples)
-            median_y = statistics.median(sample[1] for sample in samples)
-
-            if len(samples) < TAG_POSITION_MIN_SAMPLES:
-                remembered["tag_x_map"] = float(median_x)
-                remembered["tag_y_map"] = float(median_y)
-            else:
-                alpha = TAG_POSITION_EMA_ALPHA
-                remembered["tag_x_map"] = (
-                    (1.0 - alpha) * float(remembered["tag_x_map"])
-                    + alpha * median_x
-                )
-                remembered["tag_y_map"] = (
-                    (1.0 - alpha) * float(remembered["tag_y_map"])
-                    + alpha * median_y
-                )
-
-            remembered["tag_yaw_map"] = float(msg.tag_yaw_map)
-
-        self.update_best_observation_pose(tag_id, msg, now_sec)
-
-    def populate_no_visible_tag_state(self, state):
-        state.visible = False
-        state.tag_id = -1
-        state.tag_type = "none"
-        state.first_time_seen = False
-        state.known_tag = False
-        state.is_energy_bank = False
-        state.resource_available = False
-        state.resource_capacity = 0.0
-        state.resource_remaining = 0.0
-        state.resource_value = 0.0
-        state.confidence = 0.0
-        state.distance = 0.0
-        state.bearing = 0.0
-
-        state.novelty_reward = 0.0
-        state.energy_reward = 0.0
-        state.goal_reward = 0.0
-        state.total_reward = 0.0
-        state.goal_satisfied = bool(self.goal_satisfied)
-        self.set_if_available(state, "goal_known", self.goal_known())
-        self.fill_best_energy_bank(state)
-
-    def populate_visible_tag_state(
-        self,
-        state,
-        msg,
-        tag_id,
-        first_time_seen,
-        remembered,
-        now_sec,
-    ):
-        resource_remaining = float(remembered["resource_remaining"])
-        resource_available = bool(
-            remembered["is_energy_bank"] and resource_remaining > 0.0
-        )
-
-        state.visible = True
-        state.tag_id = tag_id
-        state.tag_type = str(remembered["tag_type"])
-        state.confidence = float(msg.confidence)
-        state.distance = float(msg.distance)
-        state.bearing = float(msg.bearing)
-
-        state.tag_x_map = float(remembered["tag_x_map"])
-        state.tag_y_map = float(remembered["tag_y_map"])
-        state.tag_yaw_map = float(remembered["tag_yaw_map"])
-
-        state.last_seen_robot_x_map = float(
-            remembered["last_seen_robot_x_map"]
-        )
-        state.last_seen_robot_y_map = float(
-            remembered["last_seen_robot_y_map"]
-        )
-        state.last_seen_robot_yaw_map = float(
-            remembered["last_seen_robot_yaw_map"]
-        )
-
-        state.first_time_seen = bool(first_time_seen)
-        state.known_tag = not first_time_seen
-        state.times_seen = int(remembered["times_seen"])
-        state.time_since_last_seen = max(
-            0.0, now_sec - float(remembered["last_seen_time"])
-        )
-
-        state.is_energy_bank = bool(remembered["is_energy_bank"])
-        state.resource_capacity = float(remembered["resource_capacity"])
-        state.resource_remaining = resource_remaining
-        state.resource_value = float(remembered["resource_capacity"])
-        state.resource_available = resource_available
-
-        # Compatibility only. Official e-MDB Goal/Drive nodes own reward.
-        state.novelty_reward = 0.0
-        state.energy_reward = 0.0
-        state.goal_reward = 0.0
-        state.total_reward = 0.0
-
-        state.goal_satisfied = bool(self.goal_satisfied)
-        self.set_if_available(state, "goal_known", self.goal_known())
-        self.fill_best_energy_bank(state)
-
-    # ==================================================================
-    # Policy outcomes -> factual per-tag evidence
-    # ==================================================================
-    def outcome_callback(self, msg: RobotinoPolicyOutcome):
-        # Goal success is a mission fact, not "goal marker is visible".
-        if (
-            msg.policy_id == RobotinoPolicyOutcome.POLICY_GO_TO_GOAL
-            and msg.policy_completed
-            and msg.policy_success
-        ):
-            self.goal_satisfied = True
-
-        if msg.target_type != RobotinoPolicyOutcome.TARGET_ENERGY_TAG:
-            return
-        if msg.target_id < 0:
-            return
-
-        tag_id = int(msg.target_id)
-        if tag_id not in self.memory:
-            self.get_logger().warn(
-                f"Outcome received for unknown energy tag {tag_id}; ignoring"
-            )
-            return
-
-        data = self.ensure_memory_schema(self.memory[tag_id])
-        data["last_failure_reason"] = msg.failure_reason or "none"
-
-        if msg.policy_completed and msg.recharge_attempted:
-            data["last_recharge_attempt_time"] = (
-                self.get_clock().now().nanoseconds / 1e9
-            )
-
-        if self.is_complete_successful_recharge(msg):
-            self.handle_successful_recharge(data)
-        elif self.is_complete_failed_recharge(msg):
-            self.handle_failed_recharge(data)
-        elif msg.navigation_result == RobotinoPolicyOutcome.NAV_FAILED:
-            self.handle_navigation_failure(data)
-        elif (
-            msg.navigation_result == RobotinoPolicyOutcome.NAV_SUCCEEDED
-            and msg.tag_result == RobotinoPolicyOutcome.TAG_NOT_FOUND
-        ):
-            self.handle_reached_but_tag_not_found(data)
-        else:
-            data["last_outcome"] = "UNSUPPORTED_OUTCOME"
-
-        self.log_tag_reliability(tag_id, data)
-        self.fill_best_energy_bank(self.latest_state)
-        self.save_resource_memory()
-        self.publish_current_state()
-
-    @staticmethod
-    def is_complete_successful_recharge(msg):
-        return (
-            msg.policy_id
-            == RobotinoPolicyOutcome.POLICY_RETURN_TO_ENERGY
-            and msg.policy_completed
-            and msg.policy_success
-            and msg.navigation_result
-            == RobotinoPolicyOutcome.NAV_SUCCEEDED
-            and msg.tag_result == RobotinoPolicyOutcome.TAG_FOUND
-            and msg.recharge_attempted
-            and msg.recharge_succeeded
-            and msg.energy_after > msg.energy_before
-        )
-
-    @staticmethod
-    def is_complete_failed_recharge(msg):
-        """A reached resource produced no confirmed energy increase."""
-        return (
-            msg.policy_id
-            == RobotinoPolicyOutcome.POLICY_RETURN_TO_ENERGY
-            and msg.policy_completed
-            and msg.navigation_result
-            == RobotinoPolicyOutcome.NAV_SUCCEEDED
-            and msg.recharge_attempted
-            and not msg.recharge_succeeded
-        )
-
-    def handle_successful_recharge(self, data):
-        weight = self.successful_recharge_weight
-        data["presence_positive"] += weight
-        data["reachability_positive"] += weight
-        data["recharge_positive"] += weight
-
-        data["navigation_attempts"] += 1
-        data["navigation_successes"] += 1
-        data["verification_attempts"] += 1
-        data["recharge_attempts"] += 1
-        data["recharge_successes"] += 1
-        data["consecutive_navigation_failures"] = 0
-        data["consecutive_not_found"] = 0
-        data["consecutive_recharge_failures"] = 0
-        data["status"] = "ACTIVE"
-        data["last_outcome"] = "SUCCESSFUL_RECHARGE"
-        data["last_failure_reason"] = "none"
-
-    def handle_failed_recharge(self, data):
-        """Lower learned recharge reliability without questioning the tag.
-
-        Navigation succeeded and an interaction was attempted, so presence and
-        reachability remain supported. Only rechargability receives negative
-        evidence. The resource stays remembered as a low-priority future
-        verification candidate.
-        """
-        data["navigation_attempts"] += 1
-        data["navigation_successes"] += 1
-        data["verification_attempts"] += 1
-        data["recharge_attempts"] += 1
-        data["recharge_negative"] += self.failed_recharge_weight
-        # The latest interaction is stronger evidence than a stale previous
-        # observation that the resource was available.
-        data["resource_remaining"] = 0.0
-        data["consecutive_navigation_failures"] = 0
-        data["consecutive_not_found"] = 0
-        data["consecutive_recharge_failures"] += 1
-        data["status"] = "DEPLETED_OR_NOT_READY"
-        data["last_outcome"] = "RECHARGE_FAILED"
-
-    def handle_navigation_failure(self, data):
-        data["navigation_attempts"] += 1
-        data["navigation_failures"] += 1
-        data["consecutive_navigation_failures"] += 1
-        data["reachability_negative"] += self.navigation_failure_weight
-        data["last_outcome"] = "NAVIGATION_FAILED"
-
-        # No presence or recharge update: Robotino did not inspect the tag.
-        if (
-            data["consecutive_navigation_failures"]
-            >= self.unreachable_after_consecutive_failures
-            or self.reachability_confidence(data)
-            < self.unreachable_confidence_threshold
-        ):
-            data["status"] = "TEMPORARILY_UNREACHABLE"
-
-    def handle_reached_but_tag_not_found(self, data):
-        data["navigation_attempts"] += 1
-        data["navigation_successes"] += 1
-        data["verification_attempts"] += 1
-        data["verified_absences"] += 1
-        data["consecutive_not_found"] += 1
-        data["consecutive_navigation_failures"] = 0
-
-        # The observation pose was reachable, but the resource was absent.
-        data["reachability_positive"] += self.verified_absence_weight
-        data["presence_negative"] += self.verified_absence_weight
-        data["last_outcome"] = "TAG_NOT_FOUND_AT_OBSERVATION_AREA"
-
-        if (
-            data["consecutive_not_found"]
-            >= self.missing_after_consecutive_failures
-            or self.presence_confidence(data)
-            < self.missing_confidence_threshold
-        ):
-            data["status"] = "PROBABLY_MISSING"
-        else:
-            data["status"] = "UNVERIFIED"
-
-    # ==================================================================
-    # Reliability and target ranking
-    # ==================================================================
-    def presence_confidence(self, data):
-        return self.probability(
-            data["presence_positive"], data["presence_negative"]
-        )
-
-    def reachability_confidence(self, data):
-        return self.probability(
-            data["reachability_positive"],
-            data["reachability_negative"],
-        )
-
-    def recharge_reliability(self, data):
-        return self.probability(
-            data["recharge_positive"], data["recharge_negative"]
-        )
-
-    def worthiness(self, data):
-        return (
-            self.presence_confidence(data)
-            * self.reachability_confidence(data)
-            * self.recharge_reliability(data)
-        )
-
-    def fill_best_energy_bank(self, state):
-        """Rank usable banks using the pose Robotino will actually navigate to.
-
-        The executor navigates to the saved observation pose, not directly to
-        the tag coordinate.  Therefore ranking first uses the saved observation
-        pose for travel cost and falls back to the tag pose only when needed.
-
-        An observed-available bank uses its last observed amount. A depleted
-        bank remains a low-priority verification candidate after a generic
-        cooldown; no regeneration rate is used in this ranking.
-
-        A candidate is usable only when:
-          * current semantics classify it as an energy bank;
-          * a finite target pose exists;
-          * reliability and resulting score are finite and positive.
-        """
-        best_id = -1
-        best_final_score = 0.0
-        best_foraging_score = 0.0
-        best_worthiness = 0.0
-        best_presence = 0.0
-        best_reachability = 0.0
-        best_recharge = 0.0
-        best_x = 0.0
-        best_y = 0.0
-        best_last_x = 0.0
-        best_last_y = 0.0
-        best_last_yaw = 0.0
-
-        robot_x = float(getattr(state, "robot_x_map", 0.0))
-        robot_y = float(getattr(state, "robot_y_map", 0.0))
-        if not math.isfinite(robot_x):
-            robot_x = 0.0
-        if not math.isfinite(robot_y):
-            robot_y = 0.0
-
-        candidate_summaries = []
-        now_sec = self.get_clock().now().nanoseconds / 1e9
-
-        for tag_id, raw_data in self.memory.items():
-            data = self.apply_current_semantics(tag_id, raw_data)
-
-            if not data.get("is_energy_bank", False):
-                candidate_summaries.append(f"{tag_id}:not_energy")
-                continue
-
-            remaining = float(data.get("resource_remaining", 0.0))
-            if not math.isfinite(remaining) or remaining < 0.0:
-                candidate_summaries.append(
-                    f"{tag_id}:invalid_remaining({remaining!r})"
-                )
-                continue
-
-            tag_x = float(data.get("tag_x_map", math.nan))
-            tag_y = float(data.get("tag_y_map", math.nan))
-            obs_x = float(data.get("last_seen_robot_x_map", math.nan))
-            obs_y = float(data.get("last_seen_robot_y_map", math.nan))
-            obs_yaw = float(data.get("last_seen_robot_yaw_map", math.nan))
-
-            # The observation pose is the real Nav2 target. Use it for cost.
-            if all(math.isfinite(v) for v in (obs_x, obs_y, obs_yaw)):
-                target_x = obs_x
-                target_y = obs_y
-                target_source = "observation"
-            elif all(math.isfinite(v) for v in (tag_x, tag_y)):
-                target_x = tag_x
-                target_y = tag_y
-                target_source = "tag"
-                # Keep the bridge fields finite for old records.
-                obs_x = tag_x
-                obs_y = tag_y
-                obs_yaw = 0.0
-            else:
-                candidate_summaries.append(f"{tag_id}:invalid_pose")
-                continue
-
-            distance = math.hypot(target_x - robot_x, target_y - robot_y)
-
-            if remaining > 0.0:
-                candidate_mode = "available"
-                scoring_resource = remaining
-                retry_factor = 1.0
-            else:
-                candidate_mode = "verify"
-                last_attempt = float(
-                    data.get("last_recharge_attempt_time", 0.0)
-                )
-                elapsed_since_attempt = (
-                    self.depleted_retry_delay_s
-                    if last_attempt <= 0.0
-                    else max(0.0, now_sec - last_attempt)
-                )
-                if self.depleted_retry_delay_s <= 0.0:
-                    retry_factor = 1.0
-                else:
-                    retry_factor = self.clamp(
-                        elapsed_since_attempt / self.depleted_retry_delay_s,
-                        0.0,
-                        1.0,
-                    )
-
-                scoring_resource = (
-                    float(data.get("resource_capacity", 0.0))
-                    * self.depleted_verification_score_factor
-                    * retry_factor
-                )
-                if scoring_resource <= 0.0:
-                    candidate_summaries.append(
-                        f"{tag_id}:verify_cooldown("
-                        f"retry={retry_factor:.3f})"
-                    )
-                    continue
-
-            foraging_score = scoring_resource / (1.0 + distance)
-            presence = self.presence_confidence(data)
-            reachability = self.reachability_confidence(data)
-            recharge = self.recharge_reliability(data)
-            memory_worthiness = presence * reachability * recharge
-            final_score = foraging_score * memory_worthiness
-
-            if not all(
-                math.isfinite(v)
-                for v in (
-                    distance,
-                    foraging_score,
-                    presence,
-                    reachability,
-                    recharge,
-                    memory_worthiness,
-                    final_score,
-                )
-            ):
-                candidate_summaries.append(f"{tag_id}:non_finite_score")
-                continue
-
-            candidate_summaries.append(
-                f"{tag_id}:ok(mode={candidate_mode},source={target_source},"
-                f"observed_remaining={remaining:.3f},"
-                f"retry={retry_factor:.3f},distance={distance:.3f},"
-                f"worthiness={memory_worthiness:.3f},"
-                f"score={final_score:.4f})"
-            )
-
-            if best_id < 0 or final_score > best_final_score:
-                best_final_score = final_score
-                best_foraging_score = foraging_score
-                best_worthiness = memory_worthiness
-                best_presence = presence
-                best_reachability = reachability
-                best_recharge = recharge
-                best_id = int(tag_id)
-                best_x = tag_x if math.isfinite(tag_x) else target_x
-                best_y = tag_y if math.isfinite(tag_y) else target_y
-                best_last_x = obs_x
-                best_last_y = obs_y
-                best_last_yaw = obs_yaw
-
-        state.best_energy_tag_id = int(best_id)
-        state.best_energy_x_map = float(best_x)
-        state.best_energy_y_map = float(best_y)
-        state.best_energy_score = float(best_final_score)
-        state.best_energy_last_seen_robot_x_map = float(best_last_x)
-        state.best_energy_last_seen_robot_y_map = float(best_last_y)
-        state.best_energy_last_seen_robot_yaw_map = float(best_last_yaw)
-
-        self.set_if_available(
-            state, "best_energy_foraging_score", float(best_foraging_score)
-        )
-        self.set_if_available(
-            state, "best_energy_presence_confidence", float(best_presence)
-        )
-        self.set_if_available(
-            state,
-            "best_energy_reachability_confidence",
-            float(best_reachability),
-        )
-        self.set_if_available(
-            state,
-            "best_energy_recharge_reliability",
-            float(best_recharge),
-        )
-        self.set_if_available(
-            state, "best_energy_worthiness", float(best_worthiness)
-        )
-
-        summary = " | ".join(candidate_summaries) or "memory_empty"
-        if summary != self.last_best_candidate_summary:
-            self.last_best_candidate_summary = summary
-            self.get_logger().info(f"Energy-bank candidates: {summary}")
-
-        if best_id != self.last_logged_best_energy_tag_id:
-            self.last_logged_best_energy_tag_id = best_id
-            if best_id >= 0:
-                self.get_logger().info(
-                    "Best energy bank -> tag %d | score=%.4f | "
-                    "worthiness=%.3f | presence=%.3f | reachability=%.3f | "
-                    "recharge=%.3f | observation_pose=(%.2f, %.2f, %.2f)"
-                    % (
-                        best_id,
-                        best_final_score,
-                        best_worthiness,
-                        best_presence,
-                        best_reachability,
-                        best_recharge,
-                        best_last_x,
-                        best_last_y,
-                        best_last_yaw,
-                    )
-                )
-            else:
-                self.get_logger().warn(
-                    "No usable remembered energy bank. "
-                    f"Candidates: {summary}"
-                )
-
-    def log_tag_reliability(self, tag_id, data):
-        self.get_logger().info(
-            "Tag %d | outcome=%s | status=%s | presence=%.3f | "
-            "reachability=%.3f | recharge=%.3f | worthiness=%.3f"
-            % (
-                tag_id,
-                data["last_outcome"],
-                data["status"],
-                self.presence_confidence(data),
-                self.reachability_confidence(data),
-                self.recharge_reliability(data),
-                self.worthiness(data),
-            )
-        )
-
-    # ==================================================================
-    # Observation-pose and resource simulation logic
-    # ==================================================================
-    def update_best_observation_pose(self, tag_id, msg, now_sec):
-        if tag_id not in self.memory:
-            return False
-
-        current_confidence = float(msg.confidence)
-        robot_x = float(msg.robot_x_map)
-        robot_y = float(msg.robot_y_map)
-        robot_yaw = float(msg.robot_yaw_map)
-
-        if not math.isfinite(current_confidence):
-            return False
-        if not all(
-            math.isfinite(value)
-            for value in (robot_x, robot_y, robot_yaw)
-        ):
-            return False
-
-        remembered = self.memory[tag_id]
-        previous_best = float(
-            remembered.get("best_observation_confidence", -math.inf)
-        )
-        if current_confidence <= previous_best:
-            return False
-
-        remembered["best_observation_confidence"] = current_confidence
-        remembered["best_observation_time"] = float(now_sec)
-        remembered["last_seen_robot_x_map"] = robot_x
-        remembered["last_seen_robot_y_map"] = robot_y
-        remembered["last_seen_robot_yaw_map"] = robot_yaw
-        remembered["best_observation_distance"] = float(msg.distance)
-        remembered["best_observation_bearing"] = float(msg.bearing)
-
-        self.get_logger().info(
-            f"Updated tag {tag_id} observation pose: "
-            f"confidence {previous_best:.3f} -> {current_confidence:.3f}, "
-            f"robot=({robot_x:.3f}, {robot_y:.3f}, yaw={robot_yaw:.3f})"
-        )
-        return True
-
-    def update_resource_bank(self, tag_id, now_sec):
-        """Advance hidden physical resource state using the YAML rate."""
-        resource = self.resource_truth.get(int(tag_id))
-        if resource is None:
-            return
-
-        last_time = float(resource.get("last_update_time", now_sec))
-        if last_time <= 0.0:
-            last_time = now_sec
-        dt = max(0.0, now_sec - last_time)
-
-        remaining = float(resource["remaining"])
-        regen_rate = float(resource["regen_rate"])
-        if regen_rate > 0.0:
-            remaining = min(
-                float(resource["capacity"]),
-                remaining + regen_rate * dt,
-            )
-
-        resource["remaining"] = remaining
-        resource["last_update_time"] = now_sec
-
-    def observe_resource_bank(self, tag_id):
-        """Copy only the currently observed amount into learned memory."""
-        if tag_id not in self.memory:
-            return
-        resource = self.resource_truth.get(int(tag_id))
-        if resource is None:
-            return
-        self.memory[tag_id]["resource_remaining"] = float(
-            resource["remaining"]
-        )
-
-    def collect_energy_from_bank(self, tag_id, msg, now_sec):
-        if tag_id not in self.memory:
-            return 0.0
-        data = self.memory[tag_id]
-        resource = self.resource_truth.get(int(tag_id))
-        if resource is None or not data.get("is_energy_bank", False):
-            return 0.0
-        if msg.distance <= 0.05 or msg.distance > self.arrival_distance:
-            return 0.0
-
-        remaining = float(resource["remaining"])
-        if remaining <= 0.0 or self.robot_energy >= 1.0:
-            data["resource_remaining"] = remaining
-            return 0.0
-
-        last_time = float(resource.get("last_collection_time", now_sec))
-        dt = min(max(0.0, now_sec - last_time), 1.0)
-        amount_to_take = float(resource["collection_rate"]) * dt
-        amount_taken = min(
-            amount_to_take,
-            remaining,
-            1.0 - self.robot_energy,
-        )
-
-        resource["last_collection_time"] = now_sec
-        if amount_taken <= 0.0:
-            data["resource_remaining"] = remaining
-            return 0.0
-
-        self.robot_energy = self.clamp(
-            self.robot_energy + amount_taken,
-            0.0,
-            1.0,
-        )
-        resource["remaining"] = remaining - amount_taken
-        data["resource_remaining"] = float(resource["remaining"])
-        return float(amount_taken)
 
     def destroy_node(self):
         self.save_resource_memory()

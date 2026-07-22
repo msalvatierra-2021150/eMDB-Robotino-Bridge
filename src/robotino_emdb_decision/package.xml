@@ -10,6 +10,9 @@
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
   <depend>cognitive_node_interfaces</depend>
+  <depend>cognitive_processes</depend>
+  <depend>core</depend>
+  <depend>core_interfaces</depend>
   <depend>robotino_emdb_interfaces</depend>
 
   <test_depend>ament_copyright</test_depend>
