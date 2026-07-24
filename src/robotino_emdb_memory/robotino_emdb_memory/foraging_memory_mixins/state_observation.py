@@ -72,6 +72,13 @@ class StateObservationMixin:
         state.robot_y_map = float(msg.robot_y_map)
         state.robot_yaw_map = float(msg.robot_yaw_map)
 
+        # A drained renewable resource becomes eligible for a future visit only
+        # after Robotino has physically departed from its interaction area.
+        self.maybe_rearm_blocked_recharge(
+            state.robot_x_map,
+            state.robot_y_map,
+        )
+
         if not msg.visible or msg.tag_id < 0:
             self.populate_no_visible_tag_state(state)
             self.latest_state = state
@@ -134,7 +141,10 @@ class StateObservationMixin:
         # Merely seeing or passing an energy bank must never consume it.
         # Transfer starts only after the active return-to-energy policy has
         # reached its Nav2 goal and explicitly authorizes this exact tag ID.
-        if tag_id == self.active_recharge_target_id:
+        if (
+            tag_id == self.active_recharge_target_id
+            and tag_id != self.blocked_recharge_target_id
+        ):
             self.collect_energy_from_bank(tag_id, msg, now_sec)
 
         self.populate_visible_tag_state(
@@ -286,6 +296,7 @@ class StateObservationMixin:
         # epsilon so the executor can complete cleanly.
         authorized_partial_transfer = bool(
             tag_id == self.active_recharge_target_id
+            and tag_id != self.blocked_recharge_target_id
             and supply["contains_energy"]
         )
         resource_available = bool(
@@ -359,6 +370,44 @@ class StateObservationMixin:
         self.set_if_available(state, "goal_known", self.goal_known())
         self.fill_best_energy_bank(state)
 
+    def maybe_rearm_blocked_recharge(self, robot_x, robot_y):
+        """Allow a drained renewable bank to be used on a later visit.
+
+        Clearing the executor authorization does not rearm the bank by itself;
+        otherwise a stationary Robotino could immediately consume regenerated
+        crumbs.  Rearming requires physical departure beyond the configured
+        distance from the remembered tag position.
+        """
+        blocked_tag_id = int(self.blocked_recharge_target_id)
+        if blocked_tag_id < 0:
+            return False
+
+        remembered = self.memory.get(blocked_tag_id)
+        if remembered is None:
+            self.blocked_recharge_target_id = -1
+            return True
+
+        try:
+            tag_x = float(remembered["tag_x_map"])
+            tag_y = float(remembered["tag_y_map"])
+            distance = math.hypot(float(robot_x) - tag_x, float(robot_y) - tag_y)
+        except (KeyError, TypeError, ValueError):
+            return False
+
+        if not math.isfinite(distance):
+            return False
+        if distance <= self.recharge_rearm_distance:
+            return False
+
+        self.blocked_recharge_target_id = -1
+        self.get_logger().info(
+            "Renewable bank rearmed for a future visit after Robotino left "
+            "its vicinity: "
+            f"tag_id={blocked_tag_id}, distance={distance:.3f}m, "
+            f"threshold={self.recharge_rearm_distance:.3f}m."
+        )
+        return True
+
     def recharge_target_callback(self, msg: Int32):
         """Enable transfer for a nonempty bank selected by the executor."""
         requested_tag_id = int(msg.data)
@@ -366,16 +415,15 @@ class StateObservationMixin:
 
         if requested_tag_id < 0:
             self.active_recharge_target_id = -1
-            blocked_tag_id = self.blocked_recharge_target_id
-            self.blocked_recharge_target_id = -1
-            if previous_tag_id >= 0 or blocked_tag_id >= 0:
-                cleared_tag_id = (
-                    previous_tag_id
-                    if previous_tag_id >= 0
-                    else blocked_tag_id
-                )
+            if previous_tag_id >= 0:
                 self.get_logger().info(
-                    f"Recharge authorization cleared for tag {cleared_tag_id}."
+                    f"Recharge authorization cleared for tag {previous_tag_id}."
+                )
+            if self.blocked_recharge_target_id >= 0:
+                self.get_logger().info(
+                    "Drained bank remains unavailable for the current visit "
+                    "until Robotino leaves its vicinity: "
+                    f"tag_id={self.blocked_recharge_target_id}."
                 )
             return
 

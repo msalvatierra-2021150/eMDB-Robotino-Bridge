@@ -5,9 +5,11 @@ Behavioral contract
 * CONTINUE_EXPLORING and SEARCH_FOR_ENERGY enable exploration.
 * INSPECT_VISIBLE_TAG only acknowledges that perception/memory stored a tag.
   It never disables exploration, cancels navigation, or approaches the tag.
-* RETURN_TO_BEST_ENERGY_BANK approaches the remembered energy tag, confirms
-  that charging started, and remains active until the recovery threshold is
-  reached. Depletion or timeout before recovery is reported as failed evidence.
+* RETURN_TO_BEST_ENERGY_BANK approaches the remembered energy tag and
+  confirms that charging started. The visit succeeds when either the recovery
+  threshold is reached or the current bank is drained after transferring
+  energy, allowing eMDB to select another bank. A renewable bank may regenerate
+  later, but regenerated energy is not consumed during the same visit.
 * GOAL approaches the remembered goal tag, then waits for a real reward/goal
   confirmation before reporting semantic success.
 * Stale Nav2 callbacks are ignored with an execution-generation token, so a
@@ -31,6 +33,7 @@ onto RobotinoPolicyExecutor below so they share a single `self`:
 """
 
 from collections import deque
+import math
 import random
 from typing import Any, Dict, List, Optional
 
@@ -127,6 +130,10 @@ class RobotinoPolicyExecutor(
         self.declare_parameter("interaction_check_period_s", 0.20)
         self.declare_parameter("energy_progress_delta", 0.001)
         self.declare_parameter("resource_empty_epsilon", 0.01)
+        # Start the semantic interaction once the matching visible bank is
+        # physically within transfer range, even if Nav2 has not yet satisfied
+        # the exact standoff pose/yaw goal.
+        self.declare_parameter("energy_interaction_distance_m", 1.20)
         self.declare_parameter(
             "recharge_target_topic",
             self.RECHARGE_TARGET_TOPIC,
@@ -214,6 +221,12 @@ class RobotinoPolicyExecutor(
         self.resource_empty_epsilon = max(
             0.0,
             float(self.get_parameter("resource_empty_epsilon").value),
+        )
+        self.energy_interaction_distance_m = max(
+            0.05,
+            float(
+                self.get_parameter("energy_interaction_distance_m").value
+            ),
         )
         self.recharge_target_topic = str(
             self.get_parameter("recharge_target_topic").value
@@ -432,6 +445,7 @@ class RobotinoPolicyExecutor(
             "frontier motion is guarded by the same energy hysteresis; "
             f"Nav2 watchdog={self.navigation_timeout_s:.1f}s; "
             f"resource empty<={self.resource_empty_epsilon:.3f}; "
+            f"energy interaction<={self.energy_interaction_distance_m:.2f}m; "
             f"recharge authorization={self.recharge_target_topic}."
         )
 
@@ -550,6 +564,10 @@ class RobotinoPolicyExecutor(
 
     def interaction_timer_callback(self) -> None:
         """Watch both Nav2 execution and post-arrival semantic interaction."""
+        # A tag interaction is a semantic condition, not an exact-pose
+        # condition.  Take over from Nav2 as soon as the selected visible bank
+        # is inside the configured transfer radius.
+        self.try_begin_energy_interaction_from_proximity()
         self.check_navigation_timeout()
 
         context = self.get_waiting_context()
@@ -623,6 +641,91 @@ class RobotinoPolicyExecutor(
             recharge_attempted=recharge_attempted,
             recharge_succeeded=recharge_succeeded,
         )
+
+    def try_begin_energy_interaction_from_proximity(self) -> bool:
+        """Switch from Nav2 motion to charging when the target is in range.
+
+        The approach pose is intentionally conservative and may remain
+        unreachable near a wall because of footprint inflation or final-yaw
+        constraints.  Requiring NavigateToPose to report success before
+        authorizing energy transfer can therefore leave Robotino visibly close
+        to a usable bank without charging.  A matching, visible target inside
+        the physical interaction radius is sufficient semantic arrival.
+        """
+        context = self.execution
+        if context is None or context.get("stage") != self.STAGE_NAVIGATING:
+            return False
+
+        policy = context.get("policy")
+        if policy is None:
+            return False
+        if int(policy.policy_id) != self.POLICY_RETURN_TO_BEST_ENERGY_BANK:
+            return False
+
+        state = self.latest_foraging_state
+        if state is None:
+            return False
+        if not bool(getattr(state, "visible", False)):
+            return False
+        if int(getattr(state, "tag_id", -1)) != int(policy.target_tag_id):
+            return False
+        if not bool(getattr(state, "is_energy_bank", False)):
+            return False
+
+        try:
+            distance = float(getattr(state, "distance", math.inf))
+            remaining = float(getattr(state, "resource_remaining", 0.0))
+        except (TypeError, ValueError):
+            return False
+
+        if not math.isfinite(distance) or not math.isfinite(remaining):
+            return False
+        if distance <= 0.05 or distance > self.energy_interaction_distance_m:
+            return False
+        if remaining <= self.resource_empty_epsilon:
+            return False
+
+        generation = int(context["generation"])
+        current_energy = self.get_current_energy()
+
+        # Change stage before canceling.  Generation/stage checks then cause
+        # the asynchronous canceled Nav2 result to be treated as stale rather
+        # than as a failed recovery policy.
+        context["stage"] = self.STAGE_WAITING_INTERACTION
+        context["arrival_energy"] = current_energy
+        context["last_progress_energy"] = current_energy
+        context["recharge_detected"] = False
+        context["recharge_authorized"] = True
+        context["interaction_deadline_ns"] = (
+            self.get_clock().now().nanoseconds
+            + int(self.interaction_timeout_s * 1e9)
+        )
+        context.pop("navigation_deadline_ns", None)
+
+        goal_handle = self.active_navigation_goal_handle
+        self.active_navigation_goal_handle = None
+        if goal_handle is not None:
+            try:
+                goal_handle.cancel_goal_async()
+            except Exception as ex:  # noqa: BLE001
+                self.get_logger().warn(
+                    "Failed to cancel Nav2 after semantic arrival: "
+                    f"{ex}"
+                )
+
+        self.stop_robot()
+        self.set_recharge_target(int(policy.target_tag_id))
+        self.get_logger().info(
+            "Semantic energy arrival detected before exact Nav2 completion; "
+            "canceling approach motion and authorizing transfer: "
+            f"generation={generation}, "
+            f"tag_id={int(policy.target_tag_id)}, "
+            f"distance={distance:.3f}m, "
+            f"interaction_radius={self.energy_interaction_distance_m:.3f}m, "
+            f"remaining={remaining:.3f}, "
+            f"energy={current_energy:.3f}."
+        )
+        return True
 
     def check_navigation_timeout(self) -> None:
         """Cancel a Nav2 goal that outlives the executor-owned deadline."""
@@ -792,7 +895,8 @@ class RobotinoPolicyExecutor(
 
         if recharge_detected:
             self.get_logger().info(
-                "Energy bank exhausted after a successful partial recharge: "
+                "Energy bank drained for this visit after a successful "
+                "partial recharge: "
                 f"tag_id={int(policy.target_tag_id)}, "
                 f"energy={current_energy:.3f}, gain={energy_delta:.3f}. "
                 "The policy succeeds, but exploration remains disabled so "

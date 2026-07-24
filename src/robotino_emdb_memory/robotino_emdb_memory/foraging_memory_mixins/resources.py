@@ -103,18 +103,35 @@ class ResourceSimulationMixin:
         resource["last_update_time"] = now_sec
 
     def observe_resource_bank(self, tag_id):
-        """Copy only the currently observed amount into learned memory."""
+        """Copy the observed amount into memory unless this visit is drained.
+
+        Hidden resource truth may regenerate while Robotino is still beside a
+        renewable bank.  During a drained interaction, however, the published
+        memory must remain empty so the executor can finish the visit and the
+        selector cannot immediately choose regenerated crumbs.  Once Robotino
+        leaves beyond ``recharge_rearm_distance``, a later observation may copy
+        the regenerated hidden amount again.
+        """
         if tag_id not in self.memory:
             return
         resource = self.resource_truth.get(int(tag_id))
         if resource is None:
             return
+
+        if int(tag_id) == int(self.blocked_recharge_target_id):
+            self.memory[tag_id]["resource_remaining"] = 0.0
+            self.memory[tag_id]["last_supply_reason"] = "empty_current_visit"
+            self.memory[tag_id]["last_supply_deliverable"] = 0.0
+            return
+
         self.memory[tag_id]["resource_remaining"] = float(
             resource["remaining"]
         )
 
     def collect_energy_from_bank(self, tag_id, msg, now_sec):
         if tag_id not in self.memory:
+            return 0.0
+        if int(tag_id) == int(self.blocked_recharge_target_id):
             return 0.0
         data = self.memory[tag_id]
         resource = self.resource_truth.get(int(tag_id))
@@ -181,8 +198,32 @@ class ResourceSimulationMixin:
             0.0,
             1.0,
         )
-        resource["remaining"] = remaining - amount_taken
-        data["resource_remaining"] = float(resource["remaining"])
+
+        new_remaining = max(0.0, remaining - amount_taken)
+        drained_this_visit = new_remaining <= self.resource_empty_epsilon
+        if drained_this_visit:
+            # Clamp immediately, before the next observation can advance
+            # regeneration.  This closes the race that previously allowed a
+            # renewable bank to regenerate and be consumed continuously while
+            # Robotino remained parked beside it.
+            new_remaining = 0.0
+
+        resource["remaining"] = new_remaining
+        data["resource_remaining"] = new_remaining
+
+        if drained_this_visit:
+            data["last_supply_reason"] = "empty_current_visit"
+            data["last_supply_deliverable"] = 0.0
+            self.active_recharge_target_id = -1
+            self.blocked_recharge_target_id = int(tag_id)
+            self.get_logger().info(
+                "Energy bank drained for the current visit; collection is "
+                "latched off until Robotino leaves the bank vicinity: "
+                f"tag_id={int(tag_id)}, "
+                f"energy={energy_before:.3f}->{self.robot_energy:.3f}, "
+                f"rearm_distance={self.recharge_rearm_distance:.2f}m."
+            )
+
         self.get_logger().debug(
             "Authorized energy transfer: "
             f"tag_id={tag_id}, amount={amount_taken:.4f}, "

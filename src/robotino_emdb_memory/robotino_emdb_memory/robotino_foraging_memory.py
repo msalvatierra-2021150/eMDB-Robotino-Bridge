@@ -88,9 +88,10 @@ class RobotinoForagingMemory(
         self.declare_parameter("low_energy_threshold", 0.35)
         self.declare_parameter("resume_energy_threshold", 0.50)
 
-        # When true, a bank is actionable only when its observed amount can
-        # close the full energy gap to resume_energy_threshold after decay.
-        self.declare_parameter("require_full_recovery_supply", True)
+        # By default, any bank with usable energy may contribute to recovery.
+        # Recovery may span multiple banks; one bank does not need to close the
+        # full gap to resume_energy_threshold by itself.
+        self.declare_parameter("require_full_recovery_supply", False)
         self.declare_parameter("resource_empty_epsilon", 0.01)
         self.declare_parameter("actionable_supply_epsilon", 0.005)
         self.declare_parameter("recovery_supply_margin", 0.0)
@@ -109,6 +110,10 @@ class RobotinoForagingMemory(
         self.declare_parameter("insufficient_supply_retry_delay_s", 60.0)
 
         self.declare_parameter("arrival_distance", 1.2)
+        # A drained renewable bank is unavailable for the current visit until
+        # Robotino physically leaves its vicinity. Hidden regeneration may
+        # continue, but regenerated energy belongs to a future visit.
+        self.declare_parameter("recharge_rearm_distance", 1.55)
         self.declare_parameter("same_tag_event_gap", 3.0)
         self.declare_parameter("state_publish_rate_hz", 5.0)
 
@@ -194,6 +199,10 @@ class RobotinoForagingMemory(
         self.arrival_distance = max(
             0.0,
             float(self.get_parameter("arrival_distance").value),
+        )
+        self.recharge_rearm_distance = max(
+            self.arrival_distance + 0.05,
+            float(self.get_parameter("recharge_rearm_distance").value),
         )
         self.same_tag_event_gap = max(
             0.0,
@@ -324,6 +333,7 @@ class RobotinoForagingMemory(
             f"resume={self.resume_energy_threshold:.3f}, "
             f"require_full_supply={self.require_full_recovery_supply}, "
             f"empty_epsilon={self.resource_empty_epsilon:.3f}, "
+            f"rearm_distance={self.recharge_rearm_distance:.2f}m, "
             f"insufficient_retry={self.insufficient_supply_retry_delay_s:.1f}s"
         )
 
