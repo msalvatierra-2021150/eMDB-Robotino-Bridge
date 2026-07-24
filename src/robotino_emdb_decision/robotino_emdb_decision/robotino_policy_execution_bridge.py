@@ -509,9 +509,9 @@ class RobotinoPolicyExecutionBridge(Node):
         if policy_name == "return_to_energy":
             best_tag_id = int(state.best_energy_tag_id)
             best_score = float(state.best_energy_score)
-            best_worthiness = float(
-                getattr(state, "best_energy_worthiness", 0.0)
-            )
+            # best_worthiness = float(
+            #     getattr(state, "best_energy_worthiness", 0.0)
+            # )
 
             if best_tag_id < 0:
                 self.get_logger().warn(
@@ -519,21 +519,27 @@ class RobotinoPolicyExecutionBridge(Node):
                 )
                 return None
 
-            if best_score < self.minimum_energy_bank_score:
-                self.get_logger().warn(
-                    "Cannot return to energy: best bank score "
-                    f"{best_score:.3f} is below threshold "
-                    f"{self.minimum_energy_bank_score:.3f}."
-                )
-                return None
+            # if best_score < self.minimum_energy_bank_score:
+            #     self.get_logger().warn(
+            #         "Cannot return to energy: best bank score "
+            #         f"{best_score:.3f} is below threshold "
+            #         f"{self.minimum_energy_bank_score:.3f}."
+            #     )
+            #     return None
 
-            if best_worthiness < self.minimum_energy_bank_worthiness:
+            if best_score <= 0.0:
                 self.get_logger().warn(
-                    "Cannot return to energy: best bank worthiness "
-                    f"{best_worthiness:.3f} is below threshold "
-                    f"{self.minimum_energy_bank_worthiness:.3f}."
+                    "Cannot return to energy: the remembered bank is not actionable "
+                    f"(tag_id={best_tag_id}, score={best_score:.4f})."
                 )
-                return None
+
+            # if best_worthiness < self.minimum_energy_bank_worthiness:
+            #     self.get_logger().warn(
+            #         "Cannot return to energy: best bank worthiness "
+            #         f"{best_worthiness:.3f} is below threshold "
+            #         f"{self.minimum_energy_bank_worthiness:.3f}."
+            #     )
+            #     return None
 
             values = (
                 float(state.best_energy_x_map),

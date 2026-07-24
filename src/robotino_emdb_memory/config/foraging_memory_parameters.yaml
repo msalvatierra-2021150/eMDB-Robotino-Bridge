@@ -19,3 +19,6 @@ robotino_foraging_memory:
     depleted_retry_delay_s: 60.0
     insufficient_verification_score_factor: 0.05
     insufficient_supply_retry_delay_s: 60.0
+
+    recharge_rearm_distance: 1.55
+    recharge_rearm_delay_s: 60.0

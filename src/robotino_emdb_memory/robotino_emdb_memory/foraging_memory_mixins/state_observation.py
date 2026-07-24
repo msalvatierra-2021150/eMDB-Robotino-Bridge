@@ -132,7 +132,14 @@ class StateObservationMixin:
                 remembered["last_seen_time"] = now_sec
                 remembered["presence_positive"] += 0.25
             remembered["consecutive_not_found"] = 0
-            remembered["status"] = "ACTIVE"
+            # Visibility is presence evidence, not reachability evidence. A
+            # camera sighting must not erase a Nav2 failure or its retry
+            # cooldown when an obstacle still blocks the saved approach pose.
+            if remembered.get("status") not in {
+                "NAVIGATION_RETRY_COOLDOWN",
+                "TEMPORARILY_UNREACHABLE",
+            }:
+                remembered["status"] = "ACTIVE"
 
         remembered["last_detection_time"] = now_sec
         self.update_resource_bank(tag_id, now_sec)
@@ -374,9 +381,9 @@ class StateObservationMixin:
         """Allow a drained renewable bank to be used on a later visit.
 
         Clearing the executor authorization does not rearm the bank by itself;
-        otherwise a stationary Robotino could immediately consume regenerated
-        crumbs.  Rearming requires physical departure beyond the configured
-        distance from the remembered tag position.
+        otherwise Robotino could immediately consume regenerated crumbs.
+        Rearming requires both physical departure beyond the configured
+        distance and expiration of the configured cooldown.
         """
         blocked_tag_id = int(self.blocked_recharge_target_id)
         if blocked_tag_id < 0:
@@ -385,6 +392,7 @@ class StateObservationMixin:
         remembered = self.memory.get(blocked_tag_id)
         if remembered is None:
             self.blocked_recharge_target_id = -1
+            self.blocked_recharge_until_sec = 0.0
             return True
 
         try:
@@ -399,12 +407,21 @@ class StateObservationMixin:
         if distance <= self.recharge_rearm_distance:
             return False
 
+        now_sec = self.get_clock().now().nanoseconds / 1e9
+        cooldown_until = float(
+            getattr(self, "blocked_recharge_until_sec", 0.0)
+        )
+        if now_sec < cooldown_until:
+            return False
+
         self.blocked_recharge_target_id = -1
+        self.blocked_recharge_until_sec = 0.0
         self.get_logger().info(
             "Renewable bank rearmed for a future visit after Robotino left "
-            "its vicinity: "
+            "its vicinity and the cooldown expired: "
             f"tag_id={blocked_tag_id}, distance={distance:.3f}m, "
-            f"threshold={self.recharge_rearm_distance:.3f}m."
+            f"distance_threshold={self.recharge_rearm_distance:.3f}m, "
+            f"cooldown={self.recharge_rearm_delay_s:.1f}s."
         )
         return True
 
@@ -421,8 +438,8 @@ class StateObservationMixin:
                 )
             if self.blocked_recharge_target_id >= 0:
                 self.get_logger().info(
-                    "Drained bank remains unavailable for the current visit "
-                    "until Robotino leaves its vicinity: "
+                    "Drained bank remains unavailable until Robotino leaves "
+                    "its vicinity and the cooldown expires: "
                     f"tag_id={self.blocked_recharge_target_id}."
                 )
             return
@@ -430,7 +447,7 @@ class StateObservationMixin:
         if requested_tag_id == self.blocked_recharge_target_id:
             self.get_logger().debug(
                 "Ignoring repeated recharge authorization for exhausted tag "
-                f"{requested_tag_id} until a -1 clear command is received."
+                f"{requested_tag_id} until departure and cooldown expiry."
             )
             return
 
@@ -457,7 +474,7 @@ class StateObservationMixin:
 
         if not supply["contains_energy"]:
             self.active_recharge_target_id = -1
-            self.blocked_recharge_target_id = requested_tag_id
+            self.block_recharge_target(requested_tag_id, now_sec)
             self.get_logger().warn(
                 "Rejected recharge authorization for an empty bank: "
                 f"tag_id={requested_tag_id}, "

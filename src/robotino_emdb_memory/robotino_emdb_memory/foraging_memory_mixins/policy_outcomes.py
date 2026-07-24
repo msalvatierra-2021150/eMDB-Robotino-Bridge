@@ -14,6 +14,11 @@ class PolicyOutcomeMixin:
         ):
             self.goal_satisfied = True
 
+        # Learn only from final policy episodes. Intermediate execution
+        # messages must not count as repeated visits or repeated failures.
+        if not bool(msg.policy_completed):
+            return
+
         if msg.target_type != RobotinoPolicyOutcome.TARGET_ENERGY_TAG:
             return
         if msg.target_id < 0:
@@ -172,13 +177,27 @@ class PolicyOutcomeMixin:
         data["last_outcome"] = "RECHARGE_FAILED"
 
     def handle_navigation_failure(self, data):
+        """Learn one completed failed visit and suspend immediate retries.
+
+        A Nav2 failure is negative evidence about reachability only. It does
+        not prove that the tag is absent or that the bank cannot recharge,
+        because Robotino never reached the inspection/recharge area.
+        """
+        now_sec = self.get_clock().now().nanoseconds / 1e9
         data["navigation_attempts"] += 1
         data["navigation_failures"] += 1
         data["consecutive_navigation_failures"] += 1
         data["reachability_negative"] += self.navigation_failure_weight
+        data["last_navigation_failure_time"] = now_sec
+        data["unreachable_until_time"] = max(
+            float(data.get("unreachable_until_time", 0.0)),
+            now_sec + self.unreachable_retry_delay_s,
+        )
         data["last_outcome"] = "NAVIGATION_FAILED"
 
-        # No presence or recharge update: Robotino did not inspect the tag.
+        # The bank remains remembered, but cannot be selected again during the
+        # retry cooldown. Once the cooldown expires it may be reconsidered with
+        # its now-lower reachability confidence and therefore lower worthiness.
         if (
             data["consecutive_navigation_failures"]
             >= self.unreachable_after_consecutive_failures
@@ -186,6 +205,8 @@ class PolicyOutcomeMixin:
             < self.unreachable_confidence_threshold
         ):
             data["status"] = "TEMPORARILY_UNREACHABLE"
+        else:
+            data["status"] = "NAVIGATION_RETRY_COOLDOWN"
 
     def handle_reached_but_tag_not_found(self, data):
         data["navigation_attempts"] += 1

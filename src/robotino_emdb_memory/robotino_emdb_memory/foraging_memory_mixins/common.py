@@ -62,6 +62,8 @@ class MemoryCommonMixin:
             "consecutive_not_found": 0,
             "consecutive_recharge_failures": 0,
             "last_recharge_attempt_time": 0.0,
+            "last_navigation_failure_time": 0.0,
+            "unreachable_until_time": 0.0,
             "status": "UNVERIFIED",
             "last_outcome": "none",
             "last_failure_reason": "none",

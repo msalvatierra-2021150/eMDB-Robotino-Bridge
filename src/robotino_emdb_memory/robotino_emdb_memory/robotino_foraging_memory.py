@@ -113,7 +113,6 @@ class RobotinoForagingMemory(
         # A drained renewable bank is unavailable for the current visit until
         # Robotino physically leaves its vicinity. Hidden regeneration may
         # continue, but regenerated energy belongs to a future visit.
-        self.declare_parameter("recharge_rearm_distance", 1.55)
         self.declare_parameter("same_tag_event_gap", 3.0)
         self.declare_parameter("state_publish_rate_hz", 5.0)
 
@@ -126,6 +125,10 @@ class RobotinoForagingMemory(
         self.declare_parameter("unreachable_confidence_threshold", 0.35)
         self.declare_parameter("missing_after_consecutive_failures", 2)
         self.declare_parameter("unreachable_after_consecutive_failures", 2)
+
+        # Regenerative tag Rearm
+        self.declare_parameter("recharge_rearm_distance", 1.55)
+        self.declare_parameter("recharge_rearm_delay_s", 60.0)
 
         # ------------------------------------------------------------------
         # Read parameters
@@ -204,6 +207,10 @@ class RobotinoForagingMemory(
             self.arrival_distance + 0.05,
             float(self.get_parameter("recharge_rearm_distance").value),
         )
+        self.recharge_rearm_delay_s = max(
+            0.0,
+            float(self.get_parameter("recharge_rearm_delay_s").value),
+        )
         self.same_tag_event_gap = max(
             0.0,
             float(self.get_parameter("same_tag_event_gap").value),
@@ -279,6 +286,7 @@ class RobotinoForagingMemory(
         # restarting collection as a just-drained bank regenerates by crumbs.
         # The executor's explicit -1 command clears this interaction latch.
         self.blocked_recharge_target_id = -1
+        self.blocked_recharge_until_sec = 0.0
         self.last_logged_best_energy_tag_id = None
         self.last_best_candidate_summary = None
         self.latest_state = self.create_empty_state()

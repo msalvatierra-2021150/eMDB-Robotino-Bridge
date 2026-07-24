@@ -6,11 +6,12 @@ import math
 class EnergyBankRankingMixin:
     """Publish remembered bank facts without exposing unusable recovery targets.
 
-    ``best_energy_tag_id`` and its pose/evidence fields describe the best
-    remembered bank, even when that bank is currently empty or cannot finish
-    recovery. ``best_energy_score`` is deliberately zero when no remembered
-    bank is actionable during recovery. This preserves memory in the publisher
-    while allowing the context/decision layer to select ``search_for_energy``.
+    During energy recovery, ``best_energy_tag_id`` describes only a bank that
+    can actually provide energy now. Empty, blocked, or otherwise unusable banks
+    remain in internal long-term memory but are not exposed as return targets.
+    Publishing ``best_energy_tag_id = -1`` makes the decision layer select
+    ``search_for_energy`` immediately; the resume threshold is only used to
+    decide when recovery mode may end and normal exploration may continue.
     """
 
     def _retry_factor(self, data, now_sec, delay_s):
@@ -27,6 +28,12 @@ class EnergyBankRankingMixin:
         if delay_s <= 0.0:
             return 1.0
         return self.clamp(elapsed / delay_s, 0.0, 1.0)
+
+    @staticmethod
+    def _navigation_retry_remaining(data, now_sec):
+        """Return seconds until a failed navigation target may be retried."""
+        retry_until = max(0.0, float(data.get("unreachable_until_time", 0.0)))
+        return max(0.0, retry_until - float(now_sec))
 
     @staticmethod
     def _candidate_pose(data):
@@ -168,11 +175,12 @@ class EnergyBankRankingMixin:
 
         1. An actionable candidate may become a recovery target and receives a
            positive ``best_energy_score``.
-        2. If no actionable candidate exists, the best remembered bank is still
-           published with its ID, pose and evidence, but its
-           ``best_energy_score`` is zero. This preserves factual memory while
-           making ``bank_worthy`` false in the context perception, so eMDB runs
-           ``search_for_energy`` rather than returning to the depleted bank.
+        2. While recovery is incomplete, if no actionable candidate exists,
+           publish no return target (``best_energy_tag_id = -1``). The bank is
+           still retained in ``self.memory``; it is merely hidden from policy
+           selection so eMDB must run ``search_for_energy``.
+        3. Outside recovery, remembered-only candidates may still be published
+           for delayed renewable-resource verification.
         """
         robot_x = float(getattr(state, "robot_x_map", 0.0))
         robot_y = float(getattr(state, "robot_y_map", 0.0))
@@ -198,6 +206,14 @@ class EnergyBankRankingMixin:
 
             if not data.get("is_energy_bank", False):
                 candidate_summaries.append(f"{tag_id}:not_energy")
+                continue
+
+            # A bank drained during the current visit must not become a return
+            # target again while Robotino is still beside it. Hidden renewable
+            # regeneration is intentionally reserved for a later visit after the
+            # rearm-distance condition clears this latch.
+            if int(tag_id) == int(self.blocked_recharge_target_id):
+                candidate_summaries.append(f"{tag_id}:blocked_current_visit")
                 continue
 
             remaining = float(data.get("resource_remaining", 0.0))
@@ -287,15 +303,39 @@ class EnergyBankRankingMixin:
             candidate_mode = "available" if eligible else supply["reason"]
             scoring_resource = float(supply["deliverable"])
 
-            if not eligible and not recovery_incomplete:
-                # Outside recovery, an expired verification cooldown may still
-                # produce a low-priority inspection candidate.
+            navigation_retry_remaining = self._navigation_retry_remaining(
+                data,
+                now_sec,
+            )
+            if navigation_retry_remaining > 0.0:
+                # Hard actionability gate owned by memory. Worthiness still
+                # stores the learned penalty, but a recently failed target is
+                # hidden from return_to_energy so eMDB can search elsewhere.
+                eligible = False
+                scoring_resource = 0.0
+                candidate_mode = "unreachable_cooldown"
+            elif data.get("status") in {
+                "NAVIGATION_RETRY_COOLDOWN",
+                "TEMPORARILY_UNREACHABLE",
+            }:
+                # The temporary exclusion expired. The bank may be tested
+                # again, now with its reduced reachability/worthiness score.
+                data["status"] = "ACTIVE"
+
+            if (
+                not eligible
+                and navigation_retry_remaining <= 0.0
+                and not recovery_incomplete
+            ):
+                # Outside recovery, an expired resource-verification cooldown
+                # may still produce a low-priority inspection candidate.
                 eligible = verification_resource > 0.0
                 scoring_resource = verification_resource
                 candidate_mode = verify_mode
 
             if (
                 not eligible
+                and navigation_retry_remaining <= 0.0
                 and recovery_incomplete
                 and self.allow_nonactionable_verification_during_recovery
             ):
@@ -319,8 +359,9 @@ class EnergyBankRankingMixin:
                 f"source={pose['source']},remaining={remaining:.3f},"
                 f"deliverable={supply['deliverable']:.3f},"
                 f"required={supply['required']:.3f},"
-                f"retry={retry_factor:.3f},distance={distance:.3f},"
-                f"worthiness={worthiness:.3f},"
+                f"retry={retry_factor:.3f},"
+                f"nav_retry={navigation_retry_remaining:.1f}s,"
+                f"distance={distance:.3f},worthiness={worthiness:.3f},"
                 f"target_score={max(0.0, actionable_score):.4f})"
             )
 
@@ -328,6 +369,15 @@ class EnergyBankRankingMixin:
             published = best_actionable
             published_score = best_actionable_score
             publication_mode = "actionable"
+        elif recovery_incomplete:
+            # Critical policy handoff: do not publish an unusable remembered
+            # bank while recovery is active. The remembered facts remain in
+            # self.memory, but the public target is cleared so return_to_energy
+            # cannot be selected and search_for_energy becomes the recovery
+            # policy immediately, independent of the current energy value.
+            published = None
+            published_score = 0.0
+            publication_mode = "search_required"
         else:
             published = best_remembered
             published_score = 0.0
@@ -344,7 +394,14 @@ class EnergyBankRankingMixin:
         log_signature = (published_id, publication_mode)
         if log_signature != self.last_logged_best_energy_tag_id:
             self.last_logged_best_energy_tag_id = log_signature
-            if published is None:
+            if published is None and publication_mode == "search_required":
+                self.get_logger().warn(
+                    "Energy recovery requires search: no actionable remembered "
+                    "bank is available. Publishing best_energy_tag_id=-1 so "
+                    "eMDB selects search_for_energy. "
+                    f"Candidates: {summary}"
+                )
+            elif published is None:
                 self.get_logger().warn(
                     "No remembered energy bank. "
                     f"Candidates: {summary}"

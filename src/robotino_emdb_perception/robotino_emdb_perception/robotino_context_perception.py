@@ -159,22 +159,18 @@ class RobotinoContextPerception(Perception):
 
         best_tag_id = int(getattr(state, "best_energy_tag_id", -1))
         best_score = max(0.0, float(getattr(state, "best_energy_score", 0.0)))
-        has_worthiness_field = hasattr(state, "best_energy_worthiness")
+        # has_worthiness_field = hasattr(state, "best_energy_worthiness")
         best_worthiness = self.clamp(
             getattr(state, "best_energy_worthiness", 0.0)
         )
-        bank_known = best_tag_id >= 0 and best_score > 0.0
+        bank_known = best_tag_id >= 0
         # Backward compatibility: older RobotinoForagingState definitions did
         # not contain best_energy_worthiness. In that case the memory's
         # positive best_energy_score is already reliability-weighted, so a
         # known candidate is considered worthy rather than being forced false.
         bank_worthy = (
-            bank_known
-            if not has_worthiness_field
-            else (
-                bank_known
-                and best_worthiness >= self.minimum_bank_worthiness
-            )
+            best_tag_id >= 0
+            and best_score > 0.0
         )
 
         goal_known = bool(getattr(state, "goal_known", False))

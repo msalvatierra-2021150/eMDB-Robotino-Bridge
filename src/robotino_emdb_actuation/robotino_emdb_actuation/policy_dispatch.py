@@ -57,7 +57,7 @@ class PolicyDispatchMixin:
         if mode == self.EXPLORATION_MODE_ENERGY_SEARCH:
             return (
                 self.energy_recovery_mode
-                and not self.energy_bank_is_worthy(state)
+                and not self.energy_bank_is_actionable(state)
             )
 
         return not self.energy_recovery_mode

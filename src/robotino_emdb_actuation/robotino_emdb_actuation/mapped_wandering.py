@@ -198,31 +198,17 @@ class MappedWanderingMixin:
 
         self.request_next_candidate_path(generation)
 
-    def energy_bank_is_worthy(self, state) -> bool:
-        """Use the same score/worthiness semantics as context and bridge."""
-        best_tag_id = int(getattr(state, "best_energy_tag_id", -1))
+    def energy_bank_is_actionable(self, state) -> bool:
+        """Trust the memory node's centralized bank evaluation."""
+        best_tag_id = int(
+            getattr(state, "best_energy_tag_id", -1)
+        )
         best_score = max(
             0.0,
             float(getattr(state, "best_energy_score", 0.0)),
         )
-        if (
-            best_tag_id < 0
-            or best_score <= 0.0
-            or best_score < self.minimum_energy_bank_score
-        ):
-            return False
 
-        if not hasattr(state, "best_energy_worthiness"):
-            return best_score > 0.0
-
-        best_worthiness = max(
-            0.0,
-            min(
-                1.0,
-                float(getattr(state, "best_energy_worthiness", 0.0)),
-            ),
-        )
-        return best_worthiness >= self.minimum_energy_bank_worthiness
+        return best_tag_id >= 0 and best_score > 0.0
 
     def wander_state_allows_motion(self, state, purpose: str) -> bool:
         """Check the state constraints for the requested wandering purpose."""
@@ -237,7 +223,7 @@ class MappedWanderingMixin:
             # memory offers a worthy bank that can activate return_to_energy.
             if float(state.robot_energy) >= self.resume_energy_threshold:
                 return False
-            return not self.energy_bank_is_worthy(state)
+            return not self.energy_bank_is_actionable(state)
 
         if float(state.robot_energy) <= self.wander_energy_threshold:
             return False
@@ -264,7 +250,7 @@ class MappedWanderingMixin:
         elif purpose == self.WANDER_PURPOSE_ENERGY_SEARCH:
             if float(state.robot_energy) >= self.resume_energy_threshold:
                 reason = "energy_recovered_during_search"
-            elif self.energy_bank_is_worthy(state):
+            elif self.energy_bank_is_actionable(state):
                 reason = "worthy_energy_bank_discovered"
         elif float(state.robot_energy) <= self.wander_energy_threshold:
             reason = "energy_reached_wander_threshold"
